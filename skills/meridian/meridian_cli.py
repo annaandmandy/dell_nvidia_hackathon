@@ -30,7 +30,7 @@ from meridian_format import format_response  # noqa: E402
 HOST_API = os.environ.get("MERIDIAN_HOST_API", "http://host.openshell.internal:5050")
 
 
-NEW_ROOM_PHRASES = ("new deal room", "new demo", "start a new deal", "reset the demo", "open a deal room")
+NEW_ROOM_PHRASES = ("new deal", "start a new deal", "new demo", "reset the demo", "open a deal room")
 
 
 def host_post(path: str, body: dict | None = None) -> dict:
@@ -71,10 +71,8 @@ def main() -> None:
 
     question = " ".join(args.question)
     if any(p in question.lower() for p in NEW_ROOM_PHRASES):
-        room = host_post("/api/deal-room/reset")
-        print(f"*Meridian* — `ALLOW` / `DEAL_ROOM_OPENED`\nNew deal room `{room['room_id']}` is open. "
-              "Each party: submit your signed disclosure in the deal room page; I will verify it and "
-              "run the clean room once both sides are in.")
+        room = host_post("/api/deal-room/reset", {"announce": False, "actor_id": args.sender})
+        print(f"*Meridian* — `ALLOW` / `DEAL_ROOM_OPENED`\n{room['announcement']}")
         return
     if is_visual_criteria_command(question):
         print(format_criteria_response(host_criteria(question)))

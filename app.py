@@ -1202,6 +1202,7 @@ def process_voice_transcript(transcript: str) -> dict[str, Any]:
 # ── deal room: each party uploads one signed disclosure; the rest of its package is read locally ──
 
 DEAL_ROOM_DIR = DATA_DIR / "deal_room"
+DEAL_ROOM_URL = os.environ.get("MERIDIAN_DEAL_ROOM_URL", "http://localhost:5050/deal-room")
 DEAL_ROOM_STATE = DEAL_ROOM_DIR / "state.json"
 PARTY_PACKAGE_DIR = {"A": "data/private_a", "B": "data/private_b"}
 # Which registered signature/key an uploaded payload is checked against, by issuer and content.
@@ -1305,7 +1306,7 @@ def run_clean_room(ctx: Context) -> dict[str, Any]:
     return summary
 
 
-def reset_deal_room(ctx: Context) -> dict[str, Any]:
+def reset_deal_room(ctx: Context, announce: bool = True) -> dict[str, Any]:
     """Start a fresh demo: clear uploads, archive the audit trail, reset the meeting monitors."""
     if DEAL_ROOM_DIR.exists():
         for f in DEAL_ROOM_DIR.iterdir():
@@ -1319,11 +1320,21 @@ def reset_deal_room(ctx: Context) -> dict[str, Any]:
              "parties": {}, "clean_room": None}
     save_deal_room_state(state)
     audit_decision(ctx, "ALLOW", "DEAL_ROOM_OPENED", tool="deal_room", room_id=state["room_id"])
-    post_to_slack(f":handshake: *New deal room `{state['room_id']}`* — HarborStone Financial Group (buyer) × "
-                  "QuantaShield AI (target). Meridian is the neutral party.\n"
-                  "Each side: submit your signed disclosure in the deal room. Private data stays private; "
-                  "only approved aggregates are shared.")
+    state["upload_url"] = DEAL_ROOM_URL
+    state["announcement"] = deal_room_announcement(state["room_id"])
+    if announce:  # from the page button; when Slack asked, the agent's own reply carries it
+        post_to_slack(state["announcement"])
     return state
+
+
+def deal_room_announcement(room_id: str) -> str:
+    return (f":handshake: *New deal room `{room_id}` started* — HarborStone Financial Group (buyer) × "
+            "QuantaShield AI (target). Meridian is the neutral party.\n"
+            f"Please upload your data here: {DEAL_ROOM_URL}\n"
+            "• HarborStone: your signed buyer reliability disclosure\n"
+            "• QuantaShield: your signed commercial disclosure\n"
+            "I verify every signature on arrival and run the clean room once both sides are in. "
+            "Private data stays with its owner; only approved aggregates are shared.")
 
 
 
@@ -1521,8 +1532,10 @@ if app:
 
     @app.route("/api/deal-room/reset", methods=["POST"])
     def deal_room_reset():
-        ctx = Context(actor_id="moderator", organization="NEUTRAL", channel_type="JOINT_MEETING", session_id="deal-room")
-        return jsonify(reset_deal_room(ctx))
+        body = request.get_json(silent=True) or {}
+        ctx = Context(actor_id=body.get("actor_id") or "moderator", organization="NEUTRAL",
+                      channel_type="JOINT_MEETING", session_id="deal-room")
+        return jsonify(reset_deal_room(ctx, announce=body.get("announce", True)))
 
     @app.route("/api/health")
     def health():
