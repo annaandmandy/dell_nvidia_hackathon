@@ -1,0 +1,22 @@
+{
+  "users": {
+    "U0C675Y48CR": {
+      "name": "Anna Huang",
+      "company": "northstar",
+      "role": "integration_lead",
+      "display_title": "Northstar Integration Lead",
+      "can_approve": true
+    },
+    "U0C6391DRHU": {
+      "name": "Carrie Feng",
+      "company": "orbit",
+      "role": "it_director",
+      "display_title": "Orbit IT Director",
+      "can_approve": true
+    }
+  },
+  "companies": {
+    "northstar": { "name": "Northstar Technologies", "emoji": ":large_blue_circle:" },
+    "orbit":     { "name": "Orbit Systems",          "emoji": ":large_orange_circle:" }
+  }
+}
