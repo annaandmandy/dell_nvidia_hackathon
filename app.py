@@ -1412,8 +1412,8 @@ canvas{display:none}
   <video id="video" autoplay playsinline muted></video>
   <canvas id="canvas"></canvas>
   <div class="small">
-    <span class="pill">voice chunk: 3s</span>
-    <span class="pill">visual frame: 4s</span>
+    <span class="pill">voice latency: ~2s</span>
+    <span class="pill">visual scan: 4s</span>
     <span class="pill">Slack on actions/final states</span>
   </div>
 </section>
@@ -1578,7 +1578,7 @@ function runVoiceLoop(){
     }
   };
   recorder.start();
-  setTimeout(()=>{ if(recorder && recorder.state !== 'inactive') recorder.stop(); },3000);
+  setTimeout(()=>{ if(recorder && recorder.state !== 'inactive') recorder.stop(); },2000);
 }
 
 async function runVisualLoop(){
@@ -1616,7 +1616,7 @@ async function triggerDueDiligence(){
 
 function render(){
   statusEl.textContent=meeting
-    ? `Meeting active. Voice chunks: ${voiceChunk}. Visual frames: ${visualFrame}.`
+    ? `Meeting active. Spoken turns: ${voiceChunk}. Visual scans: ${visualFrame}.`
     : 'Stopped.';
   if(lastVisual && lastVisual.monitor && lastVisual.monitor.complete){
     eventEl.textContent='On-site due diligence complete.';
@@ -1879,7 +1879,7 @@ pre{white-space:pre-wrap;word-break:break-word;min-height:360px;background:#0b10
 <div class="sub">Continuous meeting listener. Voice requests and approvals are converted into Slack channel actions.</div>
 <section class="panel">
 <div class="row">
-  <div><label>Chunk seconds</label><input id="chunkSeconds" type="number" min="2" max="12" value="3"></div>
+  <div><label>Listening latency seconds</label><input id="chunkSeconds" type="number" min="2" max="12" value="2"></div>
   <div>
     <button onclick="startListening()">Start listening</button>
     <button class="danger" onclick="stopListening()">Stop</button>
@@ -1929,7 +1929,7 @@ async function resetVoice(){
 
 async function recordOneChunk(){
   if(!listening) return;
-  const seconds=Math.max(2, Number(document.getElementById('chunkSeconds').value||3));
+  const seconds=Math.max(2, Number(document.getElementById('chunkSeconds').value||2));
   const chunks=[];
   const mimeType=pickMimeType();
   recorder=mimeType ? new MediaRecorder(stream,{mimeType}) : new MediaRecorder(stream);
@@ -1942,7 +1942,7 @@ async function recordOneChunk(){
     if(listening) cycleTimer=setTimeout(recordOneChunk,250);
   };
   recorder.start();
-  statusEl.textContent='Recording chunk '+(chunkNo+1)+'...';
+  statusEl.textContent='Listening to speaker...';
   setTimeout(()=>{ if(recorder && recorder.state !== 'inactive') recorder.stop(); }, seconds*1000);
 }
 
@@ -1953,14 +1953,14 @@ function pickMimeType(){
 
 async function sendChunk(blob){
   chunkNo += 1;
-  statusEl.textContent='Transcribing chunk '+chunkNo+'...';
+  statusEl.textContent='Transcribing speaker...';
   const form=new FormData();
   form.append('audio', blob, 'meeting-'+chunkNo+'.webm');
   try{
     const res=await fetch('/api/voice-chunk',{method:'POST',body:form});
     const data=await res.json();
     out.textContent=JSON.stringify(data,null,2);
-    statusEl.textContent='Chunk '+chunkNo+' complete. Action: '+(data.action || data.reason_code || 'none')+'. Pending: '+(data.voice && data.voice.pending_resource_id ? data.voice.pending_resource_id : 'none')+'.';
+    statusEl.textContent='Speaker turn complete. Action: '+(data.action || data.reason_code || 'none')+'. Pending: '+(data.voice && data.voice.pending_resource_id ? data.voice.pending_resource_id : 'none')+'.';
   }catch(err){
     statusEl.textContent='Voice monitor error: '+err;
   }
