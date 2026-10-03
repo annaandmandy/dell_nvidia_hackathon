@@ -320,13 +320,26 @@ def allowed(ctx: Context, reason_code: str, answer: str, sections: list[dict[str
         leaked = [m for m in private_markers() if m in rendered]
         if leaked:  # output scan: an approved answer must never carry private values
             return denied("DENY_CLASSIFICATION", ctx, safety_event="OUTPUT_SCAN_BLOCK")
-    answer = llm_polish(prompt, {"answer": answer, "sections": sections}, answer)
+    if not getattr(_POLISH, "off", False):
+        answer = llm_polish(prompt, {"answer": answer, "sections": sections}, answer)
     audit_decision(ctx, "ALLOW", reason_code, **extra)
     result = {"decision": "ALLOW", "reason_code": reason_code, "answer": answer, "sections": sections}
     if signatures:
         result["signatures"] = [{k: v for k, v in s.items() if k != "data"} for s in signatures]
     result["disclaimer"] = DISCLAIMER
     return result
+
+
+_POLISH = threading.local()
+
+
+@contextlib.contextmanager
+def no_polish():
+    _POLISH.off = True
+    try:
+        yield
+    finally:
+        _POLISH.off = False
 
 
 def section(label: str, title: str, lines: list[str]) -> dict[str, Any]:
@@ -686,6 +699,12 @@ def handle_request(text: str, ctx: Context) -> dict[str, Any]:
     # 4. Approved topics.
     if ctx.channel_type == "CAMERA" or t.startswith(("camera:", "card:")):
         return camera(ctx, prompt)
+    if report_mention(t) in {"joint-summary", "assets"}:
+        rid = report_mention(t)
+        with no_polish():
+            rep = REPORTS[rid]["build"]()
+        return allowed(ctx, "ALLOW_JOINT_APPROVED", rep["answer"], rep["sections"], prompt,
+                       signatures=rep["signatures"], intent=rid)
     if "verify" in t or "signature" in t or "tamper" in t:
         return signature_check(ctx, prompt, use_tampered=False)
     if _has(t, "agenda", "approved for both", "documents approved", "what can you show"):
@@ -1512,6 +1531,22 @@ def ingest_upload(party: str, filename: str, raw: bytes, ctx: Context) -> dict[s
     return result
 
 
+def asset_verification_list() -> list[dict[str, Any]]:
+    """Clean-room output: which registered assets must be shown on camera (no book values leave)."""
+    return [{"asset_id": r["asset_id"], "object": r["visual_object"], "target_count": int(r["quantity"]),
+             "description": r["description"], "owner": "B"}
+            for r in _csv("data/private_b/asset_register.csv") if r["verify_in_meeting"] == "yes"]
+
+
+def meeting_criteria() -> list[dict[str, Any]]:
+    """Attendance (both parties) plus the assets from the clean-room asset report."""
+    criteria = [{"id": "people_in_meeting", "object": "people in meeting", "target_count": 2,
+                 "description": "Both parties present with Slack-verified identities."}]
+    criteria += [{"id": a["asset_id"], "object": a["object"], "target_count": a["target_count"],
+                  "description": f"{a['asset_id']}: {a['description']}"} for a in asset_verification_list()]
+    return criteria
+
+
 def run_clean_room(ctx: Context) -> dict[str, Any]:
     rc = clean_room_recompute()
     receipt = verify_signed("calculation_receipt")
@@ -1536,13 +1571,22 @@ def run_clean_room(ctx: Context) -> dict[str, Any]:
             f"Buyer funding coverage {rc['buyer_funding_coverage_x']}x",
         ],
     }
-    audit_decision(ctx, "ALLOW", "CLEAN_ROOM_RUN", tool="deal_room", outputs=outputs, receipt=receipt["status"])
+    assets = asset_verification_list()
+    summary["assets"] = assets
+    save_visual_criteria(meeting_criteria(), reset_progress=True)
+    audit_decision(ctx, "ALLOW", "CLEAN_ROOM_RUN", tool="deal_room", outputs=outputs, receipt=receipt["status"],
+                   assets_to_verify=[a["asset_id"] for a in assets])
+    reports = "\n".join(f"• <{report_url(rid)}|{REPORTS[rid]['title']}> — {REPORTS[rid]['blurb']}"
+                        for rid in ("joint-summary", "commercial", "valuation", "ip-legal", "buyer-reliability"))
     post_to_slack(":lock: *Clean room complete* — both parties' private data processed inside Meridian; "
                   "only approved aggregates leave.\n"
                   + "\n".join(f"• {h}" for h in summary["highlights"])
-                  + f"\nJoint-approved outputs: {', '.join(f'`{o}`' for o in outputs)}"
-                  + f"\nCalculation receipt signature: *{receipt['status']}*\n"
-                  "Ask me about the other side's report in Slack — raw records stay private.")
+                  + f"\nCalculation receipt signature: *{receipt['status']}*\n\n"
+                  "*Reports (joint-approved)*\n" + reports + "\n\n"
+                  f"*Assets to verify on camera in the meeting* (<{report_url('assets')}|asset report>)\n"
+                  + "\n".join(f"• `{a['asset_id']}` {a['object']} ×{a['target_count']} — {a['description']}" for a in assets)
+                  + "\n\nAsk me about the other side's report here — raw records stay private. "
+                  "When you're ready: `@MergeOps new meeting`.")
     return summary
 
 
@@ -1554,14 +1598,14 @@ def reset_deal_room(ctx: Context, announce: bool = True) -> dict[str, Any]:
                 f.unlink()
     if AUDIT_PATH.exists():
         AUDIT_PATH.rename(AUDIT_PATH.with_name(f"audit-{datetime.now():%Y%m%d-%H%M%S}.jsonl"))
-    save_visual_criteria(load_visual_criteria(), reset_progress=True)
+    save_visual_criteria(meeting_criteria(), reset_progress=True)
     VOICE_MONITOR_STATE.update({"active": False, "chunk_count": 0, "pending_request_text": None, "last_action": "reset",
                                 "transcript_segments": [], "action_events": [], "meeting_started_at": None})
     # Each registered person gets a personal link by Slack DM. Only that person can read their DM, so
     # holding the token proves the Slack identity (magic-link style); the token fixes the party.
     tokens = {secrets.token_urlsafe(12): person for person in deal_room_people()}
     state = {"room_id": f"DR-{uuid.uuid4().hex[:6].upper()}", "opened_at": datetime.now(timezone.utc).isoformat(),
-             "tokens": tokens, "parties": {}, "clean_room": None}
+             "tokens": tokens, "report_token": secrets.token_urlsafe(12), "parties": {}, "clean_room": None}
     save_deal_room_state(state)
     audit_decision(ctx, "ALLOW", "DEAL_ROOM_OPENED", tool="deal_room", room_id=state["room_id"])
     dms = {person["user"]: post_dm(person["user"], upload_link_dm(state["room_id"], person, deal_room_url(token)))
@@ -1659,7 +1703,7 @@ def start_meeting(ctx: Context, announce: bool = True) -> dict[str, Any]:
             "tokens": tokens, "seen": {}, "signals": [], "next_signal": 1, "transcript": [], "events": [],
             "pending": None, "asset_owner": {}, "ended": None,
         })
-        save_visual_criteria(load_visual_criteria(), reset_progress=True)
+        save_visual_criteria(meeting_criteria(), reset_progress=True)
         VISUAL_MONITOR_STATE.update({"finalized": None, "frame_count": 0})
     audit_decision(ctx, "ALLOW", "MEETING_STARTED", tool="meeting_room", meeting_id=MEETING_ROOM["id"])
     for token, person in tokens.items():
@@ -1702,6 +1746,18 @@ def room_speech(person: dict[str, str], text: str) -> dict[str, Any]:
         room_event("disclosure", f"{speaker} released {disclosure['resource_id']} to {PARTY[disclosure['target_org']]}",
                    decision="ALLOW", reason_code=result["reason_code"])
         return {"action": "owner_disclosure"}
+
+    rid = report_mention(text)
+    if rid:
+        title = REPORTS[rid]["title"]
+        post_to_slack(f":page_facing_up: *Meeting `{MEETING_ROOM['id']}`* — {speaker} mentioned the {title}; "
+                      f"shared with both parties (joint-approved): <{report_url(rid)}|open {title}>")
+        audit_decision(ctx, "ALLOW", "REPORT_SHARED_IN_MEETING", tool="meeting_room", report=rid)
+        MEETING_ROOM["shared"] = {"report_id": rid, "title": title, "by": person["name"],
+                                  "t": datetime.now(timezone.utc).isoformat()}
+        room_event("shared", f"{speaker} mentioned the {title} — shared on screen and in Slack",
+                   decision="ALLOW", reason_code="ALLOW_JOINT_APPROVED", report_id=rid)
+        return {"action": "report_shared", "report_id": rid}
 
     pending = MEETING_ROOM.get("pending")
     if pending and detect_consent(text):
@@ -1873,6 +1929,7 @@ def room_state(me: dict[str, str] | None) -> dict[str, Any]:
         "transcript": MEETING_ROOM.get("transcript", [])[-60:], "events": MEETING_ROOM.get("events", [])[-40:],
         "pending": pending and {k: pending[k] for k in ("request", "by_name", "owner")},
         "criteria": load_visual_criteria(), "ended": MEETING_ROOM.get("ended"),
+        "shared": MEETING_ROOM.get("shared"),
     }
 
 
@@ -1893,6 +1950,125 @@ def ensure_tls_cert() -> tuple[str, str]:
     return str(cert), str(key)
 
 
+# ── reports: joint-approved documents both parties may open (/report/<id>) ──
+
+REPORT_CTX = Context(actor_id="report-viewer", organization="NEUTRAL", channel_type="JOINT_MEETING", session_id="report")
+
+
+def _report_from(fn, rid: str) -> dict[str, Any]:
+    with no_polish():
+        r = fn(REPORT_CTX, REPORTS[rid]["title"])
+    return {"answer": r.get("answer", ""), "sections": r.get("sections", []), "signatures": r.get("signatures", [])}
+
+
+def build_joint_summary() -> dict[str, Any]:
+    """The 共同摘要: one document with every joint-approved clean-room output."""
+    parts = [_report_from(valuation, "valuation"), _report_from(ip_legal, "ip-legal"),
+             _report_from(buyer_reliability, "buyer-reliability"), _report_from(term_structure, "term-structure")]
+    sections = [sec for p in parts for sec in p["sections"]]
+    sections.append(section("VERIFIED_FACT", "Assets to verify on camera",
+                            [f"{a['asset_id']} — {a['object']} ×{a['target_count']}: {a['description']}"
+                             for a in asset_verification_list()]))
+    sigs = {s_["payload"]: s_ for p in parts for s_ in p["signatures"]}
+    return {"answer": "Joint summary of the clean-room outputs approved by HarborStone Financial Group and "
+                      "QuantaShield AI: valuation, IP/legal risk, buyer reliability, the neutral structure and "
+                      "the assets to verify.", "sections": sections, "signatures": list(sigs.values())}
+
+
+def build_asset_report() -> dict[str, Any]:
+    assets = asset_verification_list()
+    criteria = {c["id"]: c for c in load_visual_criteria()}
+    lines = []
+    for a in assets:
+        c = criteria.get(a["asset_id"], {})
+        state = "Verified" if c.get("completed") else "To verify"
+        lines.append(f"{a['asset_id']} — {a['object']} ×{a['target_count']}: {a['description']} [{state}]")
+    return {"answer": "Physical assets QuantaShield AI registered for on-camera verification. Book values stay in "
+                      "the clean room; only the verification list is shared.",
+            "sections": [section("VERIFIED_FACT", "Assets to verify", lines),
+                         section("UNRESOLVED", "Verified outside the meeting",
+                                 ["Training cluster: datacenter attestation", "Model weights and pipeline: IP review"])],
+            "signatures": []}
+
+
+REPORTS: dict[str, dict[str, Any]] = {
+    "joint-summary": {"title": "Joint Summary", "blurb": "all joint-approved outputs in one document",
+                      "build": build_joint_summary},
+    "commercial": {"title": "Commercial Summary", "blurb": "ARR, margins, retention, technology evidence",
+                   "build": lambda: _report_from(technology, "commercial")},
+    "valuation": {"title": "Valuation Analysis", "blurb": "methods, risk-adjusted range, neutral assessment",
+                  "build": lambda: _report_from(valuation, "valuation")},
+    "ip-legal": {"title": "IP & Legal Summary", "blurb": "closing conditions and the $5m escrow",
+                 "build": lambda: _report_from(ip_legal, "ip-legal")},
+    "buyer-reliability": {"title": "Buyer Reliability Summary", "blurb": "funding coverage, leverage, protections",
+                          "build": lambda: _report_from(buyer_reliability, "buyer-reliability")},
+    "term-structure": {"title": "Neutral Term Structure", "blurb": "cash, escrow, earnout, closing conditions",
+                       "build": lambda: _report_from(term_structure, "term-structure")},
+    "assets": {"title": "Asset Verification Report", "blurb": "assets to show on camera",
+               "build": build_asset_report},
+}
+# Spoken names that pull a report up in the meeting (joint-approved: no extra consent needed).
+REPORT_MENTIONS = [
+    ("joint-summary", ("joint statement", "joint summary", "joint report", "clean room report", "clean-room report")),
+    ("term-structure", ("term sheet", "term structure", "deal terms")),
+    ("valuation", ("valuation report", "valuation analysis")),
+    ("commercial", ("commercial summary", "commercial report")),
+    ("ip-legal", ("ip summary", "ip report", "legal summary", "ip and legal")),
+    ("buyer-reliability", ("reliability report", "reliability summary", "funding report")),
+    ("assets", ("asset report", "asset list", "assets to verify")),
+]
+
+
+def report_mention(text: str) -> str | None:
+    t = text.lower()
+    for rid, phrases in REPORT_MENTIONS:
+        if any(p in t for p in phrases):
+            return rid
+    return None
+
+
+def report_token() -> str:
+    state = deal_room_state()
+    if not state.get("report_token"):
+        state["report_token"] = secrets.token_urlsafe(12)
+        save_deal_room_state(state)
+    return state["report_token"]
+
+
+def report_url(rid: str) -> str:
+    base = os.environ.get("MERIDIAN_REPORT_BASE") or f"http://{lan_ip()}:5050"
+    return f"{base}/report/{rid}?t={report_token()}"
+
+
+def report_identity_ok(token: str | None) -> bool:
+    rt = deal_room_state().get("report_token")
+    return bool(token) and ((rt and secrets.compare_digest(token, rt))
+                            or meeting_identity(token) is not None or deal_room_identity(token) is not None)
+
+
+LABEL_TEXT = {"VERIFIED_FACT": "Verified fact", "CALCULATED_RESULT": "Calculated result", "ASSUMPTION": "Assumption",
+              "NEUTRAL_ASSESSMENT": "Neutral assessment", "UNRESOLVED": "Unresolved"}
+
+
+def render_report_html(rid: str, report: dict[str, Any]) -> str:
+    import html as _h
+    e = _h.escape
+    meta = REPORTS[rid]
+    secs = "".join(
+        f'<section class="sec {sec["label"]}"><div class="sechead"><h2>{e(sec["title"])}</h2>'
+        f'<span class="lab">{e(LABEL_TEXT.get(sec["label"], sec["label"]))}</span></div>'
+        f'<ul>{"".join(f"<li>{e(str(line))}</li>" for line in sec["lines"])}</ul></section>'
+        for sec in report["sections"])
+    sigs = "".join(f'<tr><td>{e(sg["payload"])}</td><td>{e(sg["issuer"])}</td>'
+                   f'<td class="{ "ok" if sg["status"] == "VALID" else "bad"}">{e(sg["status"])}</td>'
+                   f'<td class="mono">{e(sg["payload_sha256"][:16])}…</td></tr>' for sg in report.get("signatures", []))
+    sig_table = (f'<section class="sec"><div class="sechead"><h2>Signature verification (Ed25519)</h2></div>'
+                 f'<table><tr><th>Payload</th><th>Issuer</th><th>Status</th><th>SHA-256</th></tr>{sigs}</table></section>'
+                 if sigs else "")
+    return REPORT_HTML.format(title=e(meta["title"]), answer=e(report["answer"]), sections=secs, signatures=sig_table,
+                              generated=datetime.now().strftime("%Y-%m-%d %H:%M"), disclaimer=e(DISCLAIMER))
+
+
 # The OpenClaw sandbox reaches this host as host.openshell.internal (a Docker bridge address).
 # Loopback gets everything; the bridge only gets the endpoints the skill needs; anyone else
 # (e.g. the venue Wi-Fi when bound to 0.0.0.0) is refused, since /api/ask trusts the
@@ -1904,7 +2080,10 @@ SANDBOX_PATHS = {"/api/visual-criteria", "/api/deal-room/reset", "/api/owner-dis
 
 # Laptops on the LAN (clicking the Slack link) may only use the deal room, and only with the
 # current room's link token. Reset, /api/ask and everything else stay loopback/sandbox-only.
-LAN_DEAL_ROOM_PATHS = {"/deal-room", "/api/deal-room", "/api/deal-room/upload"}
+LAN_DEAL_ROOM_PATHS = {"/deal-room", "/api/deal-room", "/api/deal-room/upload", "/api/deal-room/demo-file"}
+# Demo files each party may download onto its own laptop (the signed disclosures live on the GB10).
+DEMO_FILES = {"A": ["buyer_reliability_authorized.json"],
+              "B": ["startup_commercial_authorized.json", "ATTACK_tampered_startup_metrics.json"]}
 LAN_ROOM_PATHS = {"/room", "/api/room/state", "/api/room/signal", "/api/room/audio", "/api/room/frame", "/api/room/end"}
 
 
@@ -1919,6 +2098,8 @@ def request_allowed(remote_addr: str | None, path: str, token: str | None = None
         return True
     if path in LAN_ROOM_PATHS:
         return meeting_identity(token) is not None
+    if path.startswith("/report/"):
+        return report_identity_ok(token)
     return path in LAN_DEAL_ROOM_PATHS and deal_room_identity(token) is not None
 
 
@@ -2106,9 +2287,20 @@ if app:
 
     @app.route("/api/deal-room", methods=["GET"])
     def deal_room_status():
-        state = {k: v for k, v in deal_room_state().items() if k != "tokens"}
+        state = {k: v for k, v in deal_room_state().items() if k not in {"tokens", "report_token"}}
         state["me"] = deal_room_identity(request.args.get("t"))  # None = host (moderator) view on the GB10
         return jsonify(state)
+
+    @app.route("/api/deal-room/demo-file")
+    def deal_room_demo_file():
+        me = deal_room_identity(request.args.get("t"))
+        loopback = ipaddress.ip_address(request.remote_addr or "0.0.0.0").is_loopback
+        name = request.args.get("name", "")
+        allowed_names = DEMO_FILES[me["party"]] if me else (DEMO_FILES["A"] + DEMO_FILES["B"] if loopback else [])
+        if name not in allowed_names:
+            return jsonify({"error": "not available"}), 404
+        return send_file(BUNDLE / "signed_inputs" / name, mimetype="application/json", as_attachment=True,
+                         download_name=name)
 
     @app.route("/api/deal-room/upload", methods=["POST"])
     def deal_room_upload():
@@ -2128,6 +2320,15 @@ if app:
     @app.route("/room")
     def room_page() -> str:
         return ROOM_HTML
+
+    @app.route("/report/<rid>")
+    def report_page(rid: str):
+        if rid not in REPORTS:
+            return jsonify({"error": "unknown report"}), 404
+        report = REPORTS[rid]["build"]()
+        audit_decision(Context(actor_id="report-link", organization="NEUTRAL", channel_type="JOINT_MEETING",
+                               session_id="report"), "ALLOW", "REPORT_VIEWED", report=rid)
+        return render_report_html(rid, report)
 
     @app.route("/api/room/start", methods=["POST"])
     def room_start():
@@ -2632,7 +2833,7 @@ DEAL_ROOM_HTML = """<!doctype html>
   --page:#f4f5f7; --card:#ffffff; --line:#e1e4e8; --line-soft:#eef0f3;
   --text:#1f2328; --muted:#5b6472; --faint:#8a929e;
   --brand:#1f3a5f; --brand-soft:#e8eef6;
-  --a:#2563eb; --a-soft:#e8f0fe; --b:#c26a06; --b-soft:#fdf1e2;
+  --a:#007db8; --a-soft:#e5f3fa; --b:#76b900; --b-soft:#f0f8e1; --b-text:#4e7a00;
   --ok:#15803d; --ok-soft:#e7f6ec; --bad:#b91c1c; --bad-soft:#fdecec;
 }
 *{box-sizing:border-box}
@@ -2723,14 +2924,14 @@ details.pkgbox summary b{color:var(--text)}
     <section class="card" style="--c:var(--a);--soft:var(--a-soft)" id="card-A">
       <div class="party"><div class="mark">HS</div><div><h2>HarborStone Financial Group</h2><div class="role">Company A · Buyer</div></div></div>
       <label class="drop" id="drop-A"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 16V4M7 9l5-5 5 5M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg><b>Upload signed disclosure</b><span>Drag a .json file here or click to browse</span><input type="file" accept=".json,application/json" onchange="upload('A', this.files[0])"></label>
-      <div class="hint">Demo file: <code>signed_inputs/buyer_reliability_authorized.json</code></div>
+      <div class="hint">Demo file: <a href="#" onclick="return demo('buyer_reliability_authorized.json')"><code>buyer_reliability_authorized.json</code></a> — click to download</div>
       <div class="status" id="status-A">Waiting for upload.</div>
       <div id="pkg-A"></div>
     </section>
     <section class="card" style="--c:var(--b);--soft:var(--b-soft)" id="card-B">
       <div class="party"><div class="mark">QS</div><div><h2>QuantaShield AI</h2><div class="role">Company B · Target</div></div></div>
       <label class="drop" id="drop-B"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 16V4M7 9l5-5 5 5M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg><b>Upload signed disclosure</b><span>Drag a .json file here or click to browse</span><input type="file" accept=".json,application/json" onchange="upload('B', this.files[0])"></label>
-      <div class="hint">Demo file: <code>signed_inputs/startup_commercial_authorized.json</code> · tamper test: <code>ATTACK_tampered_startup_metrics.json</code></div>
+      <div class="hint">Demo file: <a href="#" onclick="return demo('startup_commercial_authorized.json')"><code>startup_commercial_authorized.json</code></a> · tamper test: <a href="#" onclick="return demo('ATTACK_tampered_startup_metrics.json')"><code>ATTACK_tampered_startup_metrics.json</code></a> — click to download</div>
       <div class="status" id="status-B">Waiting for upload.</div>
       <div id="pkg-B"></div>
     </section>
@@ -2753,6 +2954,7 @@ const NAMES={A:'HarborStone',B:'QuantaShield'};
 const TOKEN=new URLSearchParams(location.search).get('t')||'';
 const q=TOKEN?('?t='+encodeURIComponent(TOKEN)):'';
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function demo(name){ location.href='/api/deal-room/demo-file?name='+encodeURIComponent(name)+(TOKEN?'&t='+encodeURIComponent(TOKEN):''); return false; }
 function setStatus(p,ok,html){const el=document.getElementById('status-'+p);el.className='status '+(ok===null?'':ok?'ok':'bad');el.innerHTML=html}
 function renderPkg(p,pkg){
   const card=document.getElementById('card-'+p);
@@ -3152,7 +3354,7 @@ ROOM_HTML = r"""<!doctype html>
   --page:#f4f5f7; --card:#ffffff; --line:#e1e4e8; --line-soft:#eef0f3;
   --text:#1f2328; --muted:#5b6472; --faint:#8a929e;
   --brand:#1f3a5f; --brand-soft:#e8eef6;
-  --a:#2563eb; --a-soft:#e8f0fe; --b:#c26a06; --b-soft:#fdf1e2;
+  --a:#007db8; --a-soft:#e5f3fa; --b:#76b900; --b-soft:#f0f8e1; --b-text:#4e7a00;
   --ok:#15803d; --ok-soft:#e7f6ec; --bad:#b91c1c; --bad-soft:#fdecec; --warn:#a16207; --warn-soft:#fff6db;
   --tile:#1c2128;
 }
@@ -3200,6 +3402,15 @@ body{margin:0;background:var(--page);color:var(--text);font:15px/1.45 Calibri,Ca
 .side .grow .feed{flex:1;max-height:none}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;box-shadow:0 1px 2px rgba(16,24,40,.04)}
 .card h2{margin:0 0 8px;font-size:13px;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);display:flex;justify-content:space-between;align-items:center}
+.shared{display:flex;align-items:center;gap:12px;background:var(--brand-soft);border:1px solid #c9d6e8;border-radius:10px;padding:12px 14px}
+.shared .doc{width:36px;height:44px;border-radius:4px;background:#fff;border:1px solid #c9d6e8;display:grid;place-items:center;color:var(--brand);font-weight:700;font-size:11px;flex:none}
+.shared .meta{flex:1;min-width:0;font-size:14px}
+.shared .meta b{display:block;font-size:15px}
+.shared a{text-decoration:none}
+.viewer{position:absolute;inset:16px;background:#fff;border-radius:10px;box-shadow:0 10px 30px rgba(0,0,0,.4);display:flex;flex-direction:column;overflow:hidden;z-index:5}
+.viewer .vh{display:flex;align-items:center;gap:10px;padding:8px 12px;border-bottom:1px solid var(--line);font-size:14px;color:var(--muted)}
+.viewer .vh b{color:var(--text)}
+.viewer iframe{flex:1;border:0;width:100%}
 .pending{background:var(--warn-soft);border:1px solid #f1dc9c;color:#5b4304;border-radius:10px;padding:10px 12px;font-size:14px}
 .pending b{color:#3d2e02}
 .feed{display:flex;flex-direction:column;gap:8px;max-height:26vh;overflow:auto}
@@ -3210,7 +3421,7 @@ body{margin:0;background:var(--page);color:var(--text);font:15px/1.45 Calibri,Ca
 .ev code{display:inline-block;font-family:Consolas,"Liberation Mono",monospace;font-size:11.5px;line-height:1.5;color:var(--brand);background:var(--brand-soft);padding:0 5px;border-radius:3px;margin-top:2px}
 .line{font-size:14px;padding:4px 0;border-bottom:1px solid var(--line-soft)}
 .line:last-child{border-bottom:0}
-.line .sp{font-weight:700;margin-right:6px}.line .sp.A{color:var(--a)}.line .sp.B{color:var(--b)}
+.line .sp{font-weight:700;margin-right:6px}.line .sp.A{color:var(--a)}.line .sp.B{color:var(--b-text)}
 .line time{color:var(--faint);font-size:12px;margin-right:6px;font-variant-numeric:tabular-nums}
 .empty{color:var(--faint);font-size:14px}
 .progress{height:6px;background:var(--line-soft);border-radius:3px;overflow:hidden;margin-bottom:8px}
@@ -3237,6 +3448,7 @@ body{margin:0;background:var(--page);color:var(--text);font:15px/1.45 Calibri,Ca
       <div class="waiting" id="waiting"><div class="ring" id="waitRing">…</div><div id="waitText">Waiting for the other party to join…</div></div>
       <div class="plate" id="remoteTag" hidden></div>
       <div class="pip"><video id="local" autoplay playsinline muted></video><div class="plate" id="localTag"></div></div>
+      <div class="viewer" id="viewer" hidden><div class="vh"><span>Shared on screen:</span><b id="viewerTitle"></b><span class="spacer" style="flex:1"></span><button class="btn" onclick="$('viewer').hidden=true">Close</button></div><iframe id="viewerFrame" title="Shared report"></iframe></div>
     </div>
     <div class="controls">
       <button class="btn active" id="micBtn" onclick="toggleMic()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg><span>Mic on</span></button>
@@ -3248,6 +3460,7 @@ body{margin:0;background:var(--page);color:var(--text);font:15px/1.45 Calibri,Ca
     <div class="report" id="report" hidden></div>
   </section>
   <aside class="side">
+    <div class="shared" id="shared" hidden></div>
     <div class="pending" id="pending" hidden></div>
     <div class="card grow"><h2>Meridian activity</h2><div class="feed" id="events"></div></div>
     <div class="card grow"><h2>Transcript <span style="text-transform:none;letter-spacing:0;font-weight:400">Slack-verified speakers</span></h2><div class="feed" id="transcript"></div></div>
@@ -3301,7 +3514,7 @@ async function makeOffer(){
   post('/api/room/signal',{to:peer.user,payload:{type:'offer',sdp:pc.localDescription}});
 }
 function resetPc(){ if(pc){pc.close();} pc=null; iceQueue=[]; hasRemote=false; $('remote').srcObject=null; $('waiting').hidden=false; }
-let hasRemote=false;
+let hasRemote=false, lastShared=null;
 function initials(n){return (n||'?').split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase()}
 async function pollSignals(){
   if(!me) return;
@@ -3393,6 +3606,13 @@ function showEnded(r){
 
 function render(s){
   $('people').innerHTML=(s.participants||[]).map(p=>'<div class="avatar '+p.party+'" title="'+esc(p.name)+' · '+esc(p.company)+(p.online?' (online)':' (not joined)')+'">'+initials(p.name)+'<span class="st'+(p.online?' on':'')+'"></span></div>').join('');
+  const sh=s.shared;
+  $('shared').hidden=!sh;
+  if(sh) $('shared').innerHTML='<div class="doc">PDF</div><div class="meta"><b>'+esc(sh.title)+'</b>Shared by '+esc(sh.by)+' · joint-approved</div><a class="btn" href="/report/'+encodeURIComponent(sh.report_id)+'?t='+encodeURIComponent(T)+'" target="_blank" rel="noopener">Open</a>';
+  if(sh && sh.t!==lastShared){  // someone named a report: pull it up on screen for both parties
+    lastShared=sh.t; $('viewerTitle').textContent=sh.title+' — shared by '+sh.by;
+    $('viewerFrame').src='/report/'+encodeURIComponent(sh.report_id)+'?t='+encodeURIComponent(T); $('viewer').hidden=false;
+  }
   const pend=s.pending;
   $('pending').hidden=!pend;
   if(pend) $('pending').innerHTML='<b>Approval needed from '+esc(COMPANY[pend.owner])+'.</b> '+esc(pend.by_name)+' asked: “'+esc(pend.request)+'” — the owner says “yes, go ahead” to release it.';
@@ -3406,6 +3626,70 @@ function render(s){
 }
 init().catch(e=>{ $('who').textContent='Could not start: '+e.message+' (allow camera and microphone).'; });
 </script></body></html>"""
+
+
+REPORT_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{title} — Meridian</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Carlito:wght@400;700&display=swap" rel="stylesheet">
+<style>
+:root{{--page:#f4f5f7;--card:#fff;--line:#e1e4e8;--soft:#eef0f3;--text:#1f2328;--muted:#5b6472;--faint:#8a929e;
+  --brand:#1f3a5f;--a:#007db8;--b:#76b900;--ok:#15803d;--bad:#b91c1c;--warn:#a16207}}
+*{{box-sizing:border-box}}
+body{{margin:0;background:var(--page);color:var(--text);font:15px/1.5 Calibri,Carlito,"Segoe UI","Liberation Sans",Arial,sans-serif}}
+.topbar{{display:flex;align-items:center;gap:14px;padding:10px 24px;background:var(--card);border-bottom:1px solid var(--line)}}
+.brand{{display:flex;align-items:center;gap:10px;font-weight:700;color:var(--brand);font-size:18px}}
+.logo{{width:28px;height:28px;border-radius:6px;background:var(--brand);color:#fff;display:grid;place-items:center;font-size:15px}}
+.synthetic{{border:1px solid #f1b4b4;color:var(--bad);background:#fff;font-size:11px;font-weight:700;letter-spacing:.04em;padding:2px 7px;border-radius:4px}}
+.parties{{margin-left:auto;display:flex;gap:8px;font-size:13px;color:var(--muted)}}
+.parties span{{display:flex;align-items:center;gap:6px}}
+.parties i{{width:10px;height:10px;border-radius:2px;display:inline-block}}
+main{{max-width:900px;margin:0 auto;padding:28px 24px 48px}}
+.doc{{background:var(--card);border:1px solid var(--line);border-radius:10px;box-shadow:0 1px 3px rgba(16,24,40,.06);padding:32px 36px}}
+.kicker{{font-size:12px;letter-spacing:.08em;text-transform:uppercase;color:var(--faint);font-weight:700}}
+h1{{margin:4px 0 6px;font-size:28px}}
+.lead{{color:var(--muted);font-size:16px;margin:0 0 6px}}
+.gen{{color:var(--faint);font-size:13px;margin-bottom:22px}}
+.sec{{border-top:1px solid var(--line);padding:16px 0 4px}}
+.sechead{{display:flex;justify-content:space-between;align-items:baseline;gap:12px}}
+.sec h2{{margin:0 0 6px;font-size:18px}}
+.lab{{font-size:11px;font-weight:700;letter-spacing:.05em;text-transform:uppercase;padding:2px 8px;border-radius:4px;background:var(--soft);color:var(--muted);white-space:nowrap}}
+.VERIFIED_FACT .lab{{background:#e7f6ec;color:var(--ok)}}
+.CALCULATED_RESULT .lab{{background:#e8eef6;color:var(--brand)}}
+.NEUTRAL_ASSESSMENT .lab{{background:#f1eefb;color:#5b3fa8}}
+.UNRESOLVED .lab{{background:#fff6db;color:var(--warn)}}
+ul{{margin:4px 0 8px;padding-left:20px}}
+li{{margin:3px 0}}
+table{{width:100%;border-collapse:collapse;font-size:14px;margin-top:6px}}
+th{{text-align:left;font-size:12px;color:var(--faint);text-transform:uppercase;letter-spacing:.04em;padding:6px 8px 6px 0;border-bottom:1px solid var(--line)}}
+td{{padding:6px 8px 6px 0;border-bottom:1px solid var(--soft)}}
+td.ok{{color:var(--ok);font-weight:700}}td.bad{{color:var(--bad);font-weight:700}}
+.mono{{font-family:Consolas,"Liberation Mono",monospace;font-size:12px;color:var(--muted)}}
+.disc{{margin-top:22px;font-size:13px;color:var(--faint);font-style:italic}}
+</style>
+</head>
+<body>
+<div class="topbar">
+  <div class="brand"><div class="logo">M</div>Meridian</div>
+  <span class="synthetic">SYNTHETIC DEMO DATA</span>
+  <div class="parties"><span><i style="background:var(--a)"></i>HarborStone Financial Group</span><span><i style="background:var(--b)"></i>QuantaShield AI</span></div>
+</div>
+<main>
+  <article class="doc">
+    <div class="kicker">Joint-approved · HarborStone × QuantaShield</div>
+    <h1>{title}</h1>
+    <p class="lead">{answer}</p>
+    <div class="gen">Generated by Meridian (neutral party) on the GB10 · {generated}</div>
+    {sections}
+    {signatures}
+    <div class="disc">{disclaimer}</div>
+  </article>
+</main>
+</body></html>"""
 
 
 if __name__ == "__main__":

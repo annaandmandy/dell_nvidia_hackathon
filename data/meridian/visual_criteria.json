@@ -4,26 +4,26 @@
     "object": "people in meeting",
     "target_count": 2,
     "description": "At least 2 people in meeting visible.",
-    "current_count": 2,
-    "completed": true,
-    "evidence": "Only one person is visible in the frame."
+    "current_count": 0,
+    "completed": false,
+    "evidence": ""
   },
   {
     "id": "metal_cup_or_bottle",
     "object": "metal cup or bottle",
     "target_count": 1,
     "description": "At least 1 metal cup or bottle visible.",
-    "current_count": 1,
-    "completed": true,
-    "evidence": "No metal cup or bottle is visible."
+    "current_count": 0,
+    "completed": false,
+    "evidence": ""
   },
   {
     "id": "ai_host_workstation_server",
     "object": "AI host/workstation/server",
     "target_count": 1,
     "description": "At least 1 AI host/workstation/server visible.",
-    "current_count": 1,
-    "completed": true,
-    "evidence": "No servers or workstations are visible."
+    "current_count": 0,
+    "completed": false,
+    "evidence": ""
   }
 ]

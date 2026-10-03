@@ -1,0 +1,5 @@
+asset_id,category,description,quantity,book_value_usd_m,location,verify_in_meeting,visual_object
+QS-HW-01,compute,"AI inference workstation (Dell Pro Max with GB10) serving the Q-Risk and Q-Fraud models",1,0.0045,"HQ lab, on site",yes,AI host/workstation/server
+QS-INV-07,merchandise,"QuantaShield-branded metal water bottle (customer-event merchandise inventory sample)",1,0.00003,"HQ, on site",yes,metal water bottle
+QS-HW-02,compute,"Model training cluster, 16 GPUs (colocated; verified by datacenter attestation, not on camera)",1,1.2,"Colocation, Ashburn",no,
+QS-IP-01,software,"Q-Risk / Q-Fraud / Q-Doc model weights and training pipeline (verified in IP review)",1,0.0,"Source control",no,

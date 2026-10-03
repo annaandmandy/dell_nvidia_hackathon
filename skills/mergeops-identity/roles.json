@@ -16,7 +16,17 @@
     }
   },
   "companies": {
-    "harborstone":  { "name": "HarborStone Financial Group", "org": "A", "side": "buyer",  "emoji": ":large_blue_circle:" },
-    "quantashield": { "name": "QuantaShield AI",             "org": "B", "side": "target", "emoji": ":large_orange_circle:" }
+    "harborstone": {
+      "name": "HarborStone Financial Group",
+      "org": "A",
+      "side": "buyer",
+      "emoji": ":large_blue_circle:"
+    },
+    "quantashield": {
+      "name": "QuantaShield AI",
+      "org": "B",
+      "side": "target",
+      "emoji": ":large_green_circle:"
+    }
   }
 }
