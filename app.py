@@ -129,6 +129,77 @@ def can_access(resource: dict[str, Any], ctx: Context) -> tuple[bool, str]:
     return False, "DENY_UNKNOWN_CLASSIFICATION"
 
 
+def target_org_from_text(text: str) -> str | None:
+    t = text.lower()
+    if re.search(r"\b(to|with|for|show)\s+(company\s+)?a\b", t) or re.search(r"\bshow\s+a\s+our\b", t):
+        return "A"
+    if re.search(r"\b(to|with|for|show)\s+(company\s+)?b\b", t) or re.search(r"\bshow\s+b\s+our\b", t):
+        return "B"
+    return None
+
+
+def resource_matches_text(resource: dict[str, Any], text: str) -> bool:
+    t = text.lower()
+    rid = resource["resource_id"].lower()
+    title = resource.get("title", "").lower()
+    if rid in t or title in t:
+        return True
+    if resource["resource_id"] == "B_TOP_CUSTOMERS":
+        return any(k in t for k in ("top customer", "top customers", "customer file", "contract values", "customer concentration"))
+    if resource["resource_id"] == "A_BOARD_MEMO":
+        return any(k in t for k in ("board memo", "walk-away", "walk away", "acquisition strategy"))
+    return False
+
+
+def detect_owner_authorized_disclosure(text: str, ctx: Context, resources: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    t = text.lower()
+    if ctx.organization not in {"A", "B"}:
+        return None
+    authorization_phrases = (
+        "you can show",
+        "you can share",
+        "you may show",
+        "you may share",
+        "we approve sharing",
+        "i approve sharing",
+        "share our",
+        "show our",
+        "send our",
+    )
+    if not any(phrase in t for phrase in authorization_phrases):
+        return None
+    target_org = target_org_from_text(text)
+    if not target_org or target_org == ctx.organization:
+        return None
+    for resource in resources.values():
+        classification = resource.get("classification", "")
+        if resource.get("owner") != ctx.organization:
+            continue
+        if classification not in {f"{ctx.organization}_PRIVATE", "B_PRIVATE", "A_PRIVATE"}:
+            continue
+        if resource_matches_text(resource, text):
+            return {
+                "resource": resource,
+                "target_org": target_org,
+                "reason_code": "ALLOW_OWNER_AUTHORIZED_DISCLOSURE",
+            }
+    return None
+
+
+def format_authorized_private_disclosure(resource: dict[str, Any], owner_org: str, target_org: str) -> str:
+    return "\n".join([
+        f"*MergeOps pulled `{resource['resource_id']}`* — owner-authorized disclosure",
+        f"*Owner:* Company {owner_org}",
+        f"*Authorized recipient:* Company {target_org}",
+        f"*Classification:* `{resource['classification']}`",
+        "",
+        f"*{resource['title']}*",
+        resource.get("content", "No content available."),
+        "",
+        "_Disclosure was allowed because the owning party explicitly approved sharing this resource in the current channel._",
+    ])
+
+
 def detect_attack(text: str) -> str | None:
     t = text.lower()
     if "ignore all previous" in t or "ignore previous" in t:
@@ -904,11 +975,44 @@ def denied(reason_code: str, ctx: Context, text: str) -> dict[str, Any]:
 
 def handle_request(text: str, ctx: Context) -> dict[str, Any]:
     text_norm = text.strip()
+    resources = load_resources()
+
+    disclosure = detect_owner_authorized_disclosure(text_norm, ctx, resources)
+    if disclosure:
+        resource = disclosure["resource"]
+        slack_text = format_authorized_private_disclosure(
+            resource,
+            owner_org=ctx.organization,
+            target_org=disclosure["target_org"],
+        )
+        slack = post_to_slack(slack_text)
+        audit({
+            "actor_id": ctx.actor_id,
+            "organization": ctx.organization,
+            "channel_type": ctx.channel_type,
+            "decision": "ALLOW",
+            "reason_code": disclosure["reason_code"],
+            "resource_id": resource["resource_id"],
+            "target_org": disclosure["target_org"],
+            "slack_ok": slack.get("ok"),
+        })
+        return {
+            "decision": "ALLOW",
+            "reason_code": disclosure["reason_code"],
+            "answer": f"Owner-authorized disclosure accepted. Pulled {resource['resource_id']} for Company {disclosure['target_org']}.",
+            "resource": {
+                "resource_id": resource["resource_id"],
+                "title": resource["title"],
+                "classification": resource["classification"],
+                "owner": resource["owner"],
+            },
+            "slack": slack,
+        }
+
     attack = detect_attack(text_norm)
     if attack:
         return denied(attack, ctx, text_norm)
 
-    resources = load_resources()
     lower = text_norm.lower()
 
     if "agenda" in lower or "documents approved" in lower:
