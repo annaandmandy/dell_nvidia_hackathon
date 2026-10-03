@@ -1521,6 +1521,14 @@ def run_clean_room(ctx: Context) -> dict[str, Any]:
         "ran_at": datetime.now(timezone.utc).isoformat(),
         "outputs": outputs,
         "receipt": receipt["status"],
+        "kpis": [
+            {"label": "Production ARR", "value": m(rc["production_arr_usd_m"])},
+            {"label": "Top-three customer concentration", "value": f"{rc['top_three_concentration_pct']}%"},
+            {"label": "Risk-adjusted standalone range", "value": f"{m(lo)} – {m(hi)}"},
+            {"label": "DCF enterprise value", "value": m(rc["dcf_enterprise_value_usd_m"])},
+            {"label": "Five-year net synergy NPV", "value": m(rc["five_year_net_synergy_npv_usd_m"])},
+            {"label": "Buyer funding coverage", "value": f"{rc['buyer_funding_coverage_x']}x"},
+        ],
         "highlights": [
             f"Production ARR {m(rc['production_arr_usd_m'])}; top-three concentration {rc['top_three_concentration_pct']}%",
             f"Risk-adjusted standalone range {m(lo)}–{m(hi)}; DCF {m(rc['dcf_enterprise_value_usd_m'])}",
@@ -1740,6 +1748,11 @@ def room_frame(person: dict[str, str], image_data_url: str) -> dict[str, Any]:
             MEETING_ROOM["asset_owner"][c["id"]] = person["name"]
             room_event("asset", f"Verified {c['object']} ({c.get('current_count', 0)}/{c['target_count']}) on "
                                 f"{person['name']}'s camera — {c.get('evidence', '')}")
+    finalize_assets(criteria)
+    return {"criteria": criteria, "summary": result.get("summary")}
+
+
+def finalize_assets(criteria: list[dict[str, Any]]) -> None:
     if criteria_complete(criteria) and VISUAL_MONITOR_STATE.get("finalized") != "ALLOW":
         VISUAL_MONITOR_STATE["finalized"] = "ALLOW"
         lines = [f"• {c['object']}: {c.get('current_count', 0)}/{c['target_count']} — via "
@@ -1747,7 +1760,29 @@ def room_frame(person: dict[str, str], image_data_url: str) -> dict[str, Any]:
         post_to_slack(f":white_check_mark: *Meeting `{MEETING_ROOM['id']}` — on-site asset verification ALLOW*\n"
                       + "\n".join(lines))
         room_event("asset", "All asset criteria verified — posted to Slack", decision="ALLOW")
-    return {"criteria": criteria, "summary": result.get("summary")}
+
+
+def update_people_from_presence(participants: list[dict[str, Any]]) -> None:
+    """A two-party meeting: each camera shows one person, so 'people present' = Slack-verified participants online."""
+    online = [p for p in participants if p["online"]]
+    criteria = load_visual_criteria()
+    changed = False
+    for c in criteria:
+        if "people" not in c["object"].lower() and "person" not in c["object"].lower():
+            continue
+        count = max(int(c.get("current_count") or 0), len(online))
+        if count != c.get("current_count"):
+            c["current_count"] = count
+            c["evidence"] = "Joined (Slack-verified): " + ", ".join(f"{p['name']} ({PARTY[p['party']]})" for p in online)
+            changed = True
+        if count >= int(c["target_count"]) and not c.get("completed"):
+            c["completed"] = True
+            MEETING_ROOM["asset_owner"][c["id"]] = "Slack-verified attendance"
+            room_event("asset", f"{count}/{c['target_count']} people present — both parties joined with verified identities")
+            changed = True
+    if changed:
+        save_visual_criteria(criteria, reset_progress=False)
+        finalize_assets(criteria)
 
 
 def end_meeting(by: str) -> dict[str, Any]:
@@ -1829,6 +1864,9 @@ def room_state(me: dict[str, str] | None) -> dict[str, Any]:
         MEETING_ROOM["seen"][me["user"]] = now
     tokens = MEETING_ROOM.get("tokens") or {}
     participants = [{**p, "online": now - MEETING_ROOM["seen"].get(p["user"], 0) < 6} for p in tokens.values()]
+    if not MEETING_ROOM.get("ended"):
+        with ROOM_LOCK:
+            update_people_from_presence(participants)
     pending = MEETING_ROOM.get("pending")
     return {
         "meeting_id": MEETING_ROOM.get("id"), "me": me, "participants": participants,
@@ -2587,78 +2625,128 @@ DEAL_ROOM_HTML = """<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Meridian Deal Room</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Carlito:wght@400;700&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#101318;--panel:#171c24;--line:#29313f;--text:#e7edf5;--muted:#93a4b8;--a:#3b82f6;--b:#f59e0b;--ok:#22c55e;--bad:#ef4444}
+:root{
+  --page:#f4f5f7; --card:#ffffff; --line:#e1e4e8; --line-soft:#eef0f3;
+  --text:#1f2328; --muted:#5b6472; --faint:#8a929e;
+  --brand:#1f3a5f; --brand-soft:#e8eef6;
+  --a:#2563eb; --a-soft:#e8f0fe; --b:#c26a06; --b-soft:#fdf1e2;
+  --ok:#15803d; --ok-soft:#e7f6ec; --bad:#b91c1c; --bad-soft:#fdecec;
+}
 *{box-sizing:border-box}
-body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text)}
-main{max-width:1180px;margin:0 auto;padding:28px 16px}
-header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:18px}
-h1{font-size:24px;margin:0}
-.sub{color:var(--muted);margin:4px 0 0}
-.synthetic{display:inline-block;padding:2px 8px;border-radius:4px;background:#7f1d1d;color:#fecaca;font-size:12px;font-weight:700;margin-left:8px;vertical-align:middle}
-.room{font-variant-numeric:tabular-nums;color:var(--muted);font-size:13px}
-button{border-radius:6px;border:1px solid #334155;background:#212936;color:var(--text);padding:9px 14px;font-weight:600;cursor:pointer}
-button.primary{background:#2f6feb;border-color:#2f6feb}
-.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
-.card{border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:16px;border-top:4px solid var(--c)}
-.card h2{font-size:17px;margin:0 0 2px}
-.role{color:var(--muted);font-size:13px;margin-bottom:12px}
-.drop{border:2px dashed #3a4456;border-radius:8px;padding:22px 12px;text-align:center;color:var(--muted);cursor:pointer;transition:border-color .15s,background .15s}
-.drop.over{border-color:var(--c);background:#1d2430}
+[hidden]{display:none!important}
+body{margin:0;background:var(--page);color:var(--text);font:15px/1.45 Calibri,Carlito,"Segoe UI","Liberation Sans",Arial,sans-serif}
+.topbar{display:flex;align-items:center;gap:16px;padding:10px 24px;background:var(--card);border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;color:var(--brand);font-size:18px}
+.logo{width:28px;height:28px;border-radius:6px;background:var(--brand);color:#fff;display:grid;place-items:center;font-size:15px}
+.synthetic{border:1px solid #f1b4b4;color:var(--bad);background:#fff;font-size:11px;font-weight:700;letter-spacing:.04em;padding:2px 7px;border-radius:4px}
+.spacer{flex:1}
+.btn{border:1px solid var(--line);background:#fff;color:var(--text);padding:8px 14px;border-radius:8px;font:inherit;font-weight:700;cursor:pointer}
+.btn:hover{background:#f6f7f9}
+.btn.primary{background:var(--brand);border-color:var(--brand);color:#fff}
+main{max-width:1160px;margin:0 auto;padding:24px 24px 40px}
+.intro{display:flex;flex-wrap:wrap;justify-content:space-between;align-items:flex-end;gap:12px;margin-bottom:18px}
+.intro h1{margin:0;font-size:24px}
+.intro p{margin:4px 0 0;color:var(--muted)}
+.meta{text-align:right;color:var(--muted);font-size:14px}
+.meta b{color:var(--text)}
+.grid{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+@media (max-width:820px){.grid{grid-template-columns:1fr}}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:18px;box-shadow:0 1px 2px rgba(16,24,40,.04);border-top:3px solid var(--c)}
+.card.mine{box-shadow:0 0 0 2px var(--c)}
+.party{display:flex;align-items:center;gap:12px;margin-bottom:14px}
+.mark{width:40px;height:40px;border-radius:8px;display:grid;place-items:center;color:#fff;font-weight:700;background:var(--c)}
+.party h2{margin:0;font-size:18px}
+.party .role{color:var(--muted);font-size:14px}
+.drop{display:flex;flex-direction:column;align-items:center;gap:6px;border:1.5px dashed #c5cbd3;border-radius:8px;padding:22px 14px;text-align:center;color:var(--muted);cursor:pointer;background:#fafbfc;transition:border-color .15s,background .15s}
+.drop:hover,.drop.over{border-color:var(--c);background:var(--soft)}
+.drop svg{width:26px;height:26px;color:var(--c)}
+.drop b{color:var(--text)}
 .drop input{display:none}
-.hint{font-size:12px;color:var(--muted);margin-top:8px}
-.hint code{color:#c7d2fe}
-.status{margin-top:12px;padding:10px 12px;border-radius:6px;background:#0d1117;border:1px solid var(--line);font-size:14px;min-height:42px}
-.status.ok{border-color:#166534}.status.bad{border-color:#7f1d1d}
-.badge{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:700}
-.badge.ok{background:#14532d;color:#bbf7d0}.badge.bad{background:#7f1d1d;color:#fecaca}
-.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--muted);word-break:break-all}
-ul.pkg{list-style:none;margin:10px 0 0;padding:0;font-size:13px}
-ul.pkg li{display:flex;justify-content:space-between;gap:8px;padding:4px 0;border-bottom:1px solid #222a36}
-ul.pkg li span:last-child{color:var(--muted);font-size:12px}
-.clean{margin-top:16px}
-.clean h2{font-size:17px;margin:0 0 8px}
-.clean ul{margin:8px 0 0;padding-left:18px}
-.steps{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
-.step{padding:4px 10px;border-radius:999px;background:#212936;color:var(--muted);font-size:12px}
-.step.done{background:#14532d;color:#bbf7d0}
+.drop.locked{cursor:default;background:#f6f7f9;border-style:solid;border-color:var(--line);color:var(--faint)}
+.hint{font-size:13px;color:var(--faint);margin-top:8px}
+.hint code{font-family:Consolas,"Liberation Mono",monospace;font-size:12px;color:var(--brand);background:var(--brand-soft);padding:1px 4px;border-radius:3px}
+.status{margin-top:14px;padding:10px 12px;border-radius:8px;border:1px solid var(--line);background:#fafbfc;font-size:14px;color:var(--muted)}
+.status.ok{background:var(--ok-soft);border-color:#b7e1c4;color:#14532d}
+.status.bad{background:var(--bad-soft);border-color:#f3c2c2;color:#7f1d1d}
+.badge{display:inline-block;font-size:11px;font-weight:700;letter-spacing:.03em;padding:2px 7px;border-radius:4px;margin-right:6px;vertical-align:1px}
+.badge.ok{background:#fff;color:var(--ok);border:1px solid #b7e1c4}.badge.bad{background:#fff;color:var(--bad);border:1px solid #f3c2c2}
+.mono{font-family:Consolas,"Liberation Mono",monospace;font-size:12px;color:var(--muted);word-break:break-all;margin-top:4px}
+table.pkg{width:100%;border-collapse:collapse;margin-top:12px;font-size:14px}
+table.pkg th{text-align:left;font-size:12px;color:var(--faint);font-weight:700;text-transform:uppercase;letter-spacing:.04em;padding:6px 0;border-bottom:1px solid var(--line)}
+table.pkg td{padding:6px 0;border-bottom:1px solid var(--line-soft)}
+table.pkg td:last-child,table.pkg th:last-child{text-align:right}
+table.pkg td:last-child{color:var(--muted);font-size:13px}
+.card.uploaded .drop,.card.uploaded .hint{display:none}
+details.pkgbox{margin-top:12px;font-size:14px}
+details.pkgbox summary{cursor:pointer;color:var(--muted);list-style:none;display:flex;align-items:center;gap:6px}
+details.pkgbox summary::before{content:"▸";font-size:11px;color:var(--faint)}
+details.pkgbox[open] summary::before{content:"▾"}
+details.pkgbox summary b{color:var(--text)}
+.clean{margin-top:16px;--c:var(--brand)}
+.clean h2{margin:0 0 4px;font-size:18px}
+.clean .sub{color:var(--muted);font-size:14px;margin-bottom:14px}
+.steps{display:flex;gap:0;margin:6px 0 16px}
+.step{flex:1;display:flex;flex-direction:column;align-items:center;gap:6px;font-size:13px;color:var(--faint);position:relative;text-align:center}
+.step::before{content:"";position:absolute;top:13px;left:-50%;width:100%;height:2px;background:var(--line);z-index:0}
+.step:first-child::before{display:none}
+.step .n{width:28px;height:28px;border-radius:50%;display:grid;place-items:center;background:#fff;border:2px solid var(--line);font-weight:700;color:var(--faint);z-index:1}
+.step.done{color:var(--text)}
+.step.done .n{background:var(--ok);border-color:var(--ok);color:#fff}
+.step.done::before{background:var(--ok)}
+.results{display:grid;grid-template-columns:repeat(auto-fit,minmax(210px,1fr));gap:10px}
+.kpi{border:1px solid var(--line);border-radius:8px;padding:10px 12px;background:#fafbfc}
+.kpi .k{font-size:12px;color:var(--faint);text-transform:uppercase;letter-spacing:.04em}
+.kpi .v{font-size:17px;font-weight:700;margin-top:2px;color:var(--text)}
+.foot{font-size:13px;color:var(--muted);margin-top:12px}
 </style>
 </head>
-<body><main>
-<header>
-  <div>
-    <h1>Meridian Deal Room <span class="synthetic">SYNTHETIC DEMO DATA</span></h1>
-    <p class="sub">HarborStone Financial Group (buyer) × QuantaShield AI (target) — Meridian is the neutral party.</p>
-    <div class="room" id="room">No deal room open.</div>
-    <div class="room" id="who"></div>
-  </div>
-  <button class="primary" id="reset-btn" onclick="resetRoom()">New deal room</button>
-</header>
-
-<div class="grid">
-  <section class="card" style="--c:var(--a)" id="card-A">
-    <h2>HarborStone Financial Group</h2>
-    <div class="role">Company A · buyer</div>
-    <label class="drop" id="drop-A">Drop or choose your signed disclosure (.json)<input type="file" accept=".json,application/json" onchange="upload('A', this.files[0])"></label>
-    <div class="hint">Demo file: <code>signed_inputs/buyer_reliability_authorized.json</code></div>
-    <div class="status" id="status-A">Waiting for upload.</div>
-    <ul class="pkg" id="pkg-A"></ul>
-  </section>
-  <section class="card" style="--c:var(--b)" id="card-B">
-    <h2>QuantaShield AI</h2>
-    <div class="role">Company B · target</div>
-    <label class="drop" id="drop-B">Drop or choose your signed disclosure (.json)<input type="file" accept=".json,application/json" onchange="upload('B', this.files[0])"></label>
-    <div class="hint">Demo file: <code>signed_inputs/startup_commercial_authorized.json</code> · tampered: <code>ATTACK_tampered_startup_metrics.json</code></div>
-    <div class="status" id="status-B">Waiting for upload.</div>
-    <ul class="pkg" id="pkg-B"></ul>
-  </section>
+<body>
+<div class="topbar">
+  <div class="brand"><div class="logo">M</div>Meridian Deal Room</div>
+  <span class="synthetic">SYNTHETIC DEMO DATA</span>
+  <div class="spacer"></div>
+  <button class="btn primary" id="reset-btn" onclick="resetRoom()">New deal room</button>
 </div>
+<main>
+  <div class="intro">
+    <div>
+      <h1>HarborStone Financial Group × QuantaShield AI</h1>
+      <p>Each party submits one signed disclosure. Meridian, the neutral party, verifies it and runs the clean room.</p>
+    </div>
+    <div class="meta"><div id="room">No deal room open.</div><div id="who"></div></div>
+  </div>
 
-<section class="card clean" style="--c:#64748b">
-  <h2>Clean room</h2>
-  <div class="steps"><span class="step" id="st-A">HarborStone verified</span><span class="step" id="st-B">QuantaShield verified</span><span class="step" id="st-run">Recompute</span><span class="step" id="st-out">Joint-approved outputs</span></div>
-  <div id="clean" class="hint" style="font-size:14px">Runs automatically once both parties have a verified disclosure.</div>
-</section>
+  <div class="grid">
+    <section class="card" style="--c:var(--a);--soft:var(--a-soft)" id="card-A">
+      <div class="party"><div class="mark">HS</div><div><h2>HarborStone Financial Group</h2><div class="role">Company A · Buyer</div></div></div>
+      <label class="drop" id="drop-A"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 16V4M7 9l5-5 5 5M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg><b>Upload signed disclosure</b><span>Drag a .json file here or click to browse</span><input type="file" accept=".json,application/json" onchange="upload('A', this.files[0])"></label>
+      <div class="hint">Demo file: <code>signed_inputs/buyer_reliability_authorized.json</code></div>
+      <div class="status" id="status-A">Waiting for upload.</div>
+      <div id="pkg-A"></div>
+    </section>
+    <section class="card" style="--c:var(--b);--soft:var(--b-soft)" id="card-B">
+      <div class="party"><div class="mark">QS</div><div><h2>QuantaShield AI</h2><div class="role">Company B · Target</div></div></div>
+      <label class="drop" id="drop-B"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M12 16V4M7 9l5-5 5 5M4 16v3a1 1 0 0 0 1 1h14a1 1 0 0 0 1-1v-3"/></svg><b>Upload signed disclosure</b><span>Drag a .json file here or click to browse</span><input type="file" accept=".json,application/json" onchange="upload('B', this.files[0])"></label>
+      <div class="hint">Demo file: <code>signed_inputs/startup_commercial_authorized.json</code> · tamper test: <code>ATTACK_tampered_startup_metrics.json</code></div>
+      <div class="status" id="status-B">Waiting for upload.</div>
+      <div id="pkg-B"></div>
+    </section>
+  </div>
+
+  <section class="card clean">
+    <h2>Clean room</h2>
+    <div class="sub">Both parties' private data is processed inside Meridian. Only approved aggregates leave; raw records stay with their owner.</div>
+    <div class="steps">
+      <div class="step" id="st-A"><span class="n">1</span>HarborStone verified</div>
+      <div class="step" id="st-B"><span class="n">2</span>QuantaShield verified</div>
+      <div class="step" id="st-run"><span class="n">3</span>Deterministic recompute</div>
+      <div class="step" id="st-out"><span class="n">4</span>Joint-approved outputs</div>
+    </div>
+    <div id="clean" class="foot">Runs automatically once both parties have a verified disclosure.</div>
+  </section>
 </main>
 <script>
 const NAMES={A:'HarborStone',B:'QuantaShield'};
@@ -2666,7 +2754,12 @@ const TOKEN=new URLSearchParams(location.search).get('t')||'';
 const q=TOKEN?('?t='+encodeURIComponent(TOKEN)):'';
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 function setStatus(p,ok,html){const el=document.getElementById('status-'+p);el.className='status '+(ok===null?'':ok?'ok':'bad');el.innerHTML=html}
-function renderPkg(p,pkg){document.getElementById('pkg-'+p).innerHTML=(pkg||[]).map(f=>'<li><span>'+esc(f.file)+'</span><span>'+esc(f.classification)+'</span></li>').join('')}
+function renderPkg(p,pkg){
+  const card=document.getElementById('card-'+p);
+  if(!pkg||!pkg.length){ document.getElementById('pkg-'+p).innerHTML=''; card.classList.remove('uploaded'); return; }
+  card.classList.add('uploaded');
+  document.getElementById('pkg-'+p).innerHTML='<details class="pkgbox"><summary><b>'+pkg.length+' private files</b> registered as '+esc(pkg[0].classification)+' — never shown to the other side</summary><table class="pkg"><tr><th>File</th><th>Classification</th></tr>'+pkg.map(f=>'<tr><td>'+esc(f.file)+'</td><td>'+esc(f.classification)+'</td></tr>').join('')+'</table></details>';
+}
 function renderSig(sig){return '<div class="mono">issuer '+esc(sig.issuer)+' · sha256 '+esc(sig.payload_sha256.slice(0,16))+'…</div>'}
 
 async function upload(p,file){
@@ -2677,7 +2770,7 @@ async function upload(p,file){
   if(resp.status===403){setStatus(p,false,'This link has expired — use the link from the latest “new deal” message.');return}
   const r=await resp.json();
   if(r.decision==='ALLOW'){
-    setStatus(p,true,'<span class="badge ok">VALID</span> Ed25519 signature verified for <b>'+esc(file.name)+'</b>'+renderSig(r.signature)+'<div class="hint">Package registered: '+r.package.length+' private files — never shown to the other side.</div>');
+    setStatus(p,true,'<span class="badge ok">VALID</span> Ed25519 signature verified for <b>'+esc(file.name)+'</b>'+renderSig(r.signature)+'');
     renderPkg(p,r.package);
   }else{
     setStatus(p,false,'<span class="badge bad">'+esc(r.reason_code==='DENY_INVALID_SIGNATURE'?'INVALID':'REJECTED')+'</span> '+esc(r.answer)+(r.signature?renderSig(r.signature):''));
@@ -2690,12 +2783,13 @@ function applyIdentity(me){
   if(identityApplied) return; identityApplied=true;
   const who=document.getElementById('who');
   if(!me){who.textContent='Host view (GB10) — both parties';return}
-  who.innerHTML='Signed in via Slack as <b>'+esc(me.name)+'</b> — '+esc(me.title)+' · '+esc(me.company);
+  who.innerHTML='Signed in via Slack as <b>'+esc(me.name)+'</b> · '+esc(me.title);
   const other=me.party==='A'?'B':'A';
   const d=document.getElementById('drop-'+other);
-  d.innerHTML='Only '+esc(NAMES[other])+' can upload here.'; d.style.cursor='default'; d.style.opacity=.5;
-  d.replaceWith(d.cloneNode(true));
-  document.getElementById('card-'+me.party).style.boxShadow='0 0 0 2px var(--c)';
+  const locked=document.createElement('div'); locked.className='drop locked'; locked.textContent='Only '+NAMES[other]+' can upload here.';
+  d.replaceWith(locked);
+  const hint=document.querySelector('#card-'+other+' .hint'); if(hint) hint.hidden=true;
+  document.getElementById('card-'+me.party).classList.add('mine');
   document.getElementById('reset-btn').style.display='none';
 }
 
@@ -2720,7 +2814,7 @@ async function load(){
   ['A','B'].forEach(p=>{
     const v=s.parties&&s.parties[p];
     document.getElementById('st-'+p).className='step'+(v?' done':'');
-    if(v && document.getElementById('pkg-'+p).children.length===0){
+    if(v && !document.getElementById('pkg-'+p).innerHTML){
       setStatus(p,true,'<span class="badge ok">VALID</span> '+esc(v.disclosure)+renderSig(v.signature));renderPkg(p,v.package);
     }
   });
@@ -2728,9 +2822,8 @@ async function load(){
   document.getElementById('st-run').className='step'+(c?' done':'');
   document.getElementById('st-out').className='step'+(c?' done':'');
   document.getElementById('clean').innerHTML=c
-    ? '<b>Clean room complete.</b> Only approved aggregates leave; raw records stay with their owner.<ul>'+c.highlights.map(h=>'<li>'+esc(h)+'</li>').join('')+'</ul><div class="hint">Outputs: '+c.outputs.map(esc).join(', ')+' · calculation receipt '+esc(c.receipt)+'</div>'
-    : 'Runs automatically once both parties have a verified disclosure.';
-}
+    ? '<div class="results">'+(c.kpis||[]).map(k=>'<div class="kpi"><div class="k">'+esc(k.label)+'</div><div class="v">'+esc(k.value)+'</div></div>').join('')+'</div><div class="foot">Outputs: '+c.outputs.map(esc).join(', ')+' · calculation receipt signature <b>'+esc(c.receipt)+'</b></div>'
+    : 'Runs automatically once both parties have a verified disclosure.';}
 
 ['A','B'].forEach(p=>{
   const d=document.getElementById('drop-'+p);
@@ -3052,75 +3145,113 @@ ROOM_HTML = r"""<!doctype html>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Meridian Meeting</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Carlito:wght@400;700&display=swap" rel="stylesheet">
 <style>
-:root{--bg:#0e1116;--panel:#161b22;--line:#29313f;--text:#e7edf5;--muted:#93a4b8;--a:#3b82f6;--b:#f59e0b;--ok:#22c55e;--bad:#ef4444}
+:root{
+  --page:#f4f5f7; --card:#ffffff; --line:#e1e4e8; --line-soft:#eef0f3;
+  --text:#1f2328; --muted:#5b6472; --faint:#8a929e;
+  --brand:#1f3a5f; --brand-soft:#e8eef6;
+  --a:#2563eb; --a-soft:#e8f0fe; --b:#c26a06; --b-soft:#fdf1e2;
+  --ok:#15803d; --ok-soft:#e7f6ec; --bad:#b91c1c; --bad-soft:#fdecec; --warn:#a16207; --warn-soft:#fff6db;
+  --tile:#1c2128;
+}
 *{box-sizing:border-box}
-body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text)}
-main{max-width:1320px;margin:0 auto;padding:18px 16px}
-header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin-bottom:14px}
-h1{font-size:20px;margin:0}
-.synthetic{display:inline-block;padding:2px 8px;border-radius:4px;background:#7f1d1d;color:#fecaca;font-size:11px;font-weight:700;margin-left:8px;vertical-align:middle}
-.muted{color:var(--muted);font-size:13px}
-.people{display:flex;gap:8px;flex-wrap:wrap}
-.chip{display:flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;background:#1f2631;font-size:13px}
-.dot{width:8px;height:8px;border-radius:50%;background:#475569}.dot.on{background:var(--ok)}
-.layout{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(300px,1fr);gap:14px}
-@media (max-width:900px){.layout{grid-template-columns:1fr}}
-.stage{position:relative;background:#000;border-radius:10px;overflow:hidden;aspect-ratio:16/9;border:1px solid var(--line)}
-.stage video{width:100%;height:100%;object-fit:cover;background:#05070a}
-#local{position:absolute;right:12px;bottom:12px;width:26%;aspect-ratio:16/9;height:auto;border-radius:8px;border:2px solid #334155}
-.tag{position:absolute;left:12px;bottom:12px;padding:3px 10px;border-radius:6px;background:rgba(0,0,0,.6);font-size:13px}
-.waiting{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:15px;text-align:center;padding:20px}
-.controls{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
-button{border-radius:8px;border:1px solid #334155;background:#212936;color:var(--text);padding:9px 14px;font-weight:600;cursor:pointer;font-size:14px}
-button.on{background:#14532d;border-color:#166534}button.off{background:#3f1d1d;border-color:#7f1d1d}
-button.end{background:var(--bad);border-color:var(--bad);margin-left:auto}
-.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:10px;min-height:0}
-.panel h2{font-size:14px;margin:0;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
-.pending{padding:10px;border-radius:8px;background:#2a2112;border:1px solid #7c5a10;font-size:14px}
-.list{overflow:auto;max-height:30vh;display:flex;flex-direction:column;gap:6px;font-size:14px}
-.ev{padding:7px 9px;border-radius:6px;background:#1c222c;border-left:3px solid #475569}
-.ev.ALLOW{border-left-color:var(--ok)}.ev.DENY{border-left-color:var(--bad)}.ev.pending{border-left-color:var(--b)}
-.ev code{font-size:12px;color:#c7d2fe}
-.line b.A{color:#93c5fd}.line b.B{color:#fcd34d}
-.crit{font-size:13px;display:flex;flex-direction:column;gap:3px}
-pre{white-space:pre-wrap;background:#0b0f14;border:1px solid var(--line);border-radius:8px;padding:12px;font-size:13px;max-height:50vh;overflow:auto}
-.err{padding:30px;text-align:center;color:var(--muted)}
+[hidden]{display:none!important}
+html,body{height:100%}
+body{margin:0;background:var(--page);color:var(--text);font:15px/1.45 Calibri,Carlito,"Segoe UI","Liberation Sans",Arial,sans-serif}
+.topbar{display:flex;align-items:center;gap:16px;padding:10px 20px;background:var(--card);border-bottom:1px solid var(--line)}
+.brand{display:flex;align-items:center;gap:10px;font-weight:700;color:var(--brand);font-size:18px}
+.logo{width:28px;height:28px;border-radius:6px;background:var(--brand);color:#fff;display:grid;place-items:center;font-size:15px}
+.mid{color:var(--muted);font-weight:400;font-size:14px}
+.synthetic{border:1px solid #f1b4b4;color:var(--bad);background:#fff;font-size:11px;font-weight:700;letter-spacing:.04em;padding:2px 7px;border-radius:4px}
+.spacer{flex:1}
+.who{color:var(--muted);font-size:14px;text-align:right}
+.who b{color:var(--text)}
+.people{display:flex;gap:6px}
+.avatar{position:relative;width:32px;height:32px;border-radius:50%;display:grid;place-items:center;color:#fff;font-weight:700;font-size:13px}
+.avatar.A{background:var(--a)}.avatar.B{background:var(--b)}
+.avatar .st{position:absolute;right:-1px;bottom:-1px;width:10px;height:10px;border-radius:50%;border:2px solid #fff;background:#9aa3ad}
+.avatar .st.on{background:var(--ok)}
+.layout{display:grid;grid-template-columns:minmax(0,1fr) 380px;gap:16px;padding:16px 20px;height:calc(100vh - 53px)}
+@media (max-width:1000px){.layout{grid-template-columns:1fr;height:auto}}
+.stagewrap{display:flex;flex-direction:column;gap:12px;min-width:0;min-height:0}
+.stage{position:relative;flex:1;min-height:320px;background:var(--tile);border-radius:12px;overflow:hidden;box-shadow:0 1px 3px rgba(16,24,40,.12)}
+.stage > video{width:100%;height:100%;object-fit:contain;display:block;background:var(--tile)}
+.pip{position:absolute;right:16px;bottom:16px;width:24%;min-width:180px;aspect-ratio:16/9;border-radius:10px;overflow:hidden;background:#2a313b;box-shadow:0 4px 14px rgba(0,0,0,.35);border:2px solid rgba(255,255,255,.85)}
+.pip video{width:100%;height:100%;object-fit:cover;display:block;transform:scaleX(-1)}
+.pip .plate{left:8px;bottom:8px;font-size:12px;padding:2px 8px 2px 6px}
+.plate{position:absolute;left:10px;bottom:10px;display:flex;align-items:center;gap:8px;padding:4px 10px 4px 8px;border-radius:6px;background:rgba(255,255,255,.94);font-size:13px;color:var(--text)}
+.plate .bar{width:4px;height:16px;border-radius:2px}
+.plate .bar.A{background:var(--a)}.plate .bar.B{background:var(--b)}
+.waiting{position:absolute;inset:0;display:flex;flex-direction:column;gap:10px;align-items:center;justify-content:center;color:#c9d1d9;font-size:15px;text-align:center;padding:20px}
+.waiting .ring{width:64px;height:64px;border-radius:50%;display:grid;place-items:center;font-size:22px;font-weight:700;color:#fff;background:#3a424d}
+.controls{display:flex;justify-content:center;gap:10px;padding:10px;background:var(--card);border:1px solid var(--line);border-radius:10px}
+.btn{display:inline-flex;align-items:center;gap:8px;border:1px solid var(--line);background:#fff;color:var(--text);padding:8px 14px;border-radius:8px;font:inherit;font-weight:700;cursor:pointer}
+.btn:hover{background:#f6f7f9}
+.btn.off{background:var(--bad-soft);border-color:#f3c2c2;color:var(--bad)}
+.btn.active{background:var(--ok-soft);border-color:#b7e1c4;color:var(--ok)}
+.btn.end{background:var(--bad);border-color:var(--bad);color:#fff}
+.btn:disabled{opacity:.5;cursor:default}
+.btn svg{width:18px;height:18px}
+.netstatus{font-size:13px;color:var(--muted);text-align:center}
+.side{display:flex;flex-direction:column;gap:12px;min-height:0}
+.side .grow{flex:1;min-height:0;display:flex;flex-direction:column}
+.side .grow .feed{flex:1;max-height:none}
+.card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px 14px;box-shadow:0 1px 2px rgba(16,24,40,.04)}
+.card h2{margin:0 0 8px;font-size:13px;letter-spacing:.05em;text-transform:uppercase;color:var(--muted);display:flex;justify-content:space-between;align-items:center}
+.pending{background:var(--warn-soft);border:1px solid #f1dc9c;color:#5b4304;border-radius:10px;padding:10px 12px;font-size:14px}
+.pending b{color:#3d2e02}
+.feed{display:flex;flex-direction:column;gap:8px;max-height:26vh;overflow:auto}
+.ev{display:flex;gap:8px;align-items:flex-start;font-size:14px;padding-bottom:8px;border-bottom:1px solid var(--line-soft)}
+.ev:last-child{border-bottom:0;padding-bottom:0}
+.badge{flex:none;font-size:11px;font-weight:700;letter-spacing:.03em;padding:2px 7px;border-radius:4px;background:#eef1f4;color:var(--muted)}
+.badge.ALLOW{background:var(--ok-soft);color:var(--ok)}.badge.DENY{background:var(--bad-soft);color:var(--bad)}.badge.WAIT{background:var(--warn-soft);color:var(--warn)}
+.ev code{display:inline-block;font-family:Consolas,"Liberation Mono",monospace;font-size:11.5px;line-height:1.5;color:var(--brand);background:var(--brand-soft);padding:0 5px;border-radius:3px;margin-top:2px}
+.line{font-size:14px;padding:4px 0;border-bottom:1px solid var(--line-soft)}
+.line:last-child{border-bottom:0}
+.line .sp{font-weight:700;margin-right:6px}.line .sp.A{color:var(--a)}.line .sp.B{color:var(--b)}
+.line time{color:var(--faint);font-size:12px;margin-right:6px;font-variant-numeric:tabular-nums}
+.empty{color:var(--faint);font-size:14px}
+.progress{height:6px;background:var(--line-soft);border-radius:3px;overflow:hidden;margin-bottom:8px}
+.progress i{display:block;height:100%;background:var(--ok);width:0;transition:width .3s}
+.crit{display:flex;flex-direction:column;gap:6px;font-size:14px}
+.crit div{display:flex;justify-content:space-between;gap:8px}
+.crit .ok{color:var(--ok);font-weight:700}.crit .open{color:var(--faint)}
+.report{background:var(--ok-soft);border:1px solid #b7e1c4;color:#14532d;border-radius:10px;padding:12px 14px;font-size:14px}
+.err{margin:60px auto;max-width:520px;text-align:center;color:var(--muted);background:var(--card);border:1px solid var(--line);border-radius:10px;padding:30px}
 </style>
 </head>
-<body><main>
-<header>
-  <div>
-    <h1>Meridian meeting <span id="mid"></span><span class="synthetic">SYNTHETIC DEMO DATA</span></h1>
-    <div class="muted" id="who">Connecting…</div>
-  </div>
+<body>
+<div class="topbar">
+  <div class="brand"><div class="logo">M</div>Meridian <span class="mid" id="mid"></span></div>
+  <span class="synthetic">SYNTHETIC DEMO DATA</span>
+  <div class="spacer"></div>
+  <div class="who" id="who">Connecting…</div>
   <div class="people" id="people"></div>
-</header>
+</div>
 <div id="app" class="layout">
-  <section>
+  <section class="stagewrap">
     <div class="stage">
       <video id="remote" autoplay playsinline></video>
-      <div class="waiting" id="waiting">Waiting for the other party to join…</div>
-      <div class="tag" id="remoteTag" hidden></div>
-      <video id="local" autoplay playsinline muted></video>
+      <div class="waiting" id="waiting"><div class="ring" id="waitRing">…</div><div id="waitText">Waiting for the other party to join…</div></div>
+      <div class="plate" id="remoteTag" hidden></div>
+      <div class="pip"><video id="local" autoplay playsinline muted></video><div class="plate" id="localTag"></div></div>
     </div>
     <div class="controls">
-      <button id="micBtn" class="on" onclick="toggleMic()">Mic on</button>
-      <button id="camBtn" class="on" onclick="toggleCam()">Camera on</button>
-      <button id="verifyBtn" onclick="toggleVerify()">Verify my assets: off</button>
-      <button class="end" onclick="endMeeting()">End meeting</button>
+      <button class="btn active" id="micBtn" onclick="toggleMic()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="9" y="3" width="6" height="11" rx="3"/><path d="M5 11a7 7 0 0 0 14 0M12 18v3"/></svg><span>Mic on</span></button>
+      <button class="btn active" id="camBtn" onclick="toggleCam()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><rect x="3" y="6" width="13" height="12" rx="2"/><path d="M16 10l5-3v10l-5-3z"/></svg><span>Camera on</span></button>
+      <button class="btn" id="verifyBtn" onclick="toggleVerify()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/></svg><span>Verify my assets: off</span></button>
+      <button class="btn end" onclick="endMeeting()">End meeting</button>
     </div>
-    <div class="muted" id="netStatus" style="margin-top:8px"></div>
-    <pre id="report" hidden></pre>
+    <div class="netstatus" id="netStatus"></div>
+    <div class="report" id="report" hidden></div>
   </section>
-  <aside class="panel">
-    <div id="pending" class="pending" hidden></div>
-    <h2>Meridian</h2>
-    <div class="list" id="events"></div>
-    <h2>Transcript (Slack-verified speakers)</h2>
-    <div class="list" id="transcript"></div>
-    <h2>Asset verification</h2>
-    <div class="crit" id="criteria"></div>
+  <aside class="side">
+    <div class="pending" id="pending" hidden></div>
+    <div class="card grow"><h2>Meridian activity</h2><div class="feed" id="events"></div></div>
+    <div class="card grow"><h2>Transcript <span style="text-transform:none;letter-spacing:0;font-weight:400">Slack-verified speakers</span></h2><div class="feed" id="transcript"></div></div>
+    <div class="card"><h2>Asset verification <span id="critCount" style="text-transform:none;letter-spacing:0"></span></h2><div class="progress"><i id="critBar"></i></div><div class="crit" id="criteria"></div></div>
   </aside>
 </div>
 <script>
@@ -3139,12 +3270,13 @@ function post(path, body){return api(path,{method:'POST',headers:{'Content-Type'
 async function init(){
   let s;
   try{ s=await api('/api/room/state'); }catch(e){ s={}; }
-  if(!s.me){ $('app').innerHTML='<div class="err">This meeting link is not valid any more. Use the latest link Meridian sent you in Slack.</div>'; $('who').textContent=''; return; }
-  me=s.me; $('mid').textContent=s.meeting_id;
-  $('who').innerHTML='Signed in via Slack as <b>'+esc(me.name)+'</b> — '+esc(me.title)+' · '+esc(me.company);
+  if(!s.me){ $('app').outerHTML='<div class="err"><b>This meeting link is no longer valid.</b><br>Use the latest link Meridian sent you by Slack DM.</div>'; $('who').textContent=''; return; }
+  me=s.me; $('mid').textContent='· '+s.meeting_id;
+  $('who').innerHTML='Signed in via Slack as <b>'+esc(me.name)+'</b><br>'+esc(me.title)+' · '+esc(me.company);
+  $('localTag').innerHTML='<span class="bar '+me.party+'"></span>You · '+esc(me.name);
+  render(s);  // show the meeting before the browser's camera prompt
   stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:1280},height:{ideal:720}},audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
   $('local').srcObject=stream;
-  render(s);
   setInterval(pollState,1500); setInterval(pollSignals,700);
   audioLoop(); setInterval(frameTick,7000);
   pollSignals();
@@ -3155,7 +3287,7 @@ function ensurePc(){
   if(pc) return pc;
   pc=new RTCPeerConnection({iceServers:[]});
   stream.getTracks().forEach(t=>pc.addTrack(t,stream));
-  pc.ontrack=e=>{ $('remote').srcObject=e.streams[0]; $('waiting').hidden=true; };
+  pc.ontrack=e=>{ $('remote').srcObject=e.streams[0]; hasRemote=true; $('waiting').hidden=true; };
   pc.onicecandidate=e=>{ if(e.candidate && peer) post('/api/room/signal',{to:peer.user,payload:{type:'ice',candidate:e.candidate}}); };
   pc.onconnectionstatechange=()=>{
     $('netStatus').textContent='Peer connection: '+pc.connectionState;
@@ -3168,7 +3300,9 @@ async function makeOffer(){
   const offer=await pc.createOffer(); await pc.setLocalDescription(offer);
   post('/api/room/signal',{to:peer.user,payload:{type:'offer',sdp:pc.localDescription}});
 }
-function resetPc(){ if(pc){pc.close();} pc=null; iceQueue=[]; $('remote').srcObject=null; $('waiting').hidden=false; }
+function resetPc(){ if(pc){pc.close();} pc=null; iceQueue=[]; hasRemote=false; $('remote').srcObject=null; $('waiting').hidden=false; }
+let hasRemote=false;
+function initials(n){return (n||'?').split(' ').map(w=>w[0]).join('').slice(0,2).toUpperCase()}
 async function pollSignals(){
   if(!me) return;
   let msgs=[]; try{ msgs=await api('/api/room/signal?since='+since); }catch(e){ return; }
@@ -3190,7 +3324,12 @@ async function pollState(){
   const other=(s.participants||[]).find(p=>p.user!==me.user && p.online);
   if(other && !greeted){ greeted=true; peer=other; post('/api/room/signal',{to:other.user,payload:{type:'hello'}}); if(me.user>other.user && !pc) makeOffer(); }
   if(!other && greeted){ greeted=false; resetPc(); }
-  if(other){ peer=other; $('remoteTag').hidden=false; $('remoteTag').textContent=other.name+' · '+other.company; } else { $('remoteTag').hidden=true; }
+  const expected=(s.participants||[]).find(p=>p.user!==me.user);
+  if(other){ peer=other; $('remoteTag').hidden=false; $('remoteTag').innerHTML='<span class="bar '+other.party+'"></span>'+esc(other.name)+' · '+esc(other.company); } else { $('remoteTag').hidden=true; }
+  if(!hasRemote && expected){
+    $('waiting').hidden=false; $('waitRing').textContent=initials(expected.name);
+    $('waitText').textContent=other ? (expected.name+' joined — connecting video…') : ('Waiting for '+expected.name+' ('+expected.company+') to join…');
+  }
   render(s);
 }
 
@@ -3236,9 +3375,10 @@ async function frameTick(){
   try{ await post('/api/room/frame',{image_data_url:c.toDataURL('image/jpeg',0.8)}); pollState(); }catch(e){}
 }
 
-function toggleMic(){ micOn=!micOn; stream.getAudioTracks().forEach(t=>t.enabled=micOn); $('micBtn').className=micOn?'on':'off'; $('micBtn').textContent=micOn?'Mic on':'Mic off'; }
-function toggleCam(){ camOn=!camOn; stream.getVideoTracks().forEach(t=>t.enabled=camOn); $('camBtn').className=camOn?'on':'off'; $('camBtn').textContent=camOn?'Camera on':'Camera off'; }
-function toggleVerify(){ verifyOn=!verifyOn; $('verifyBtn').className=verifyOn?'on':''; $('verifyBtn').textContent='Verify my assets: '+(verifyOn?'on':'off'); if(verifyOn) frameTick(); }
+function setBtn(id,cls,label){ $(id).className='btn '+cls; $(id).querySelector('span').textContent=label; }
+function toggleMic(){ micOn=!micOn; stream.getAudioTracks().forEach(t=>t.enabled=micOn); setBtn('micBtn',micOn?'active':'off',micOn?'Mic on':'Mic off'); }
+function toggleCam(){ camOn=!camOn; stream.getVideoTracks().forEach(t=>t.enabled=camOn); setBtn('camBtn',camOn?'active':'off',camOn?'Camera on':'Camera off'); }
+function toggleVerify(){ verifyOn=!verifyOn; setBtn('verifyBtn',verifyOn?'active':'','Verify my assets: '+(verifyOn?'on':'off')); if(verifyOn) frameTick(); }
 async function endMeeting(){
   if(ended) return;
   const r=await post('/api/room/end',{}); showEnded(r);
@@ -3246,19 +3386,22 @@ async function endMeeting(){
 function showEnded(r){
   if(!r || ended) return; ended=true;
   $('report').hidden=false;
-  $('report').textContent='Meeting ended — the report and next steps were posted to Slack.\nNext meeting proposed: '+(r.next_meeting||'—');
+  $('report').innerHTML='<b>Meeting ended.</b> The report and next steps were posted to Slack. Next meeting proposed: <b>'+esc(r.next_meeting||'—')+'</b>.';
   ['micBtn','camBtn','verifyBtn'].forEach(id=>$(id).disabled=true);
   resetPc(); if(stream) stream.getTracks().forEach(t=>t.stop());
 }
 
 function render(s){
-  $('people').innerHTML=(s.participants||[]).map(p=>'<span class="chip"><span class="dot'+(p.online?' on':'')+'"></span>'+esc(p.name)+' · '+esc(COMPANY[p.party])+'</span>').join('');
+  $('people').innerHTML=(s.participants||[]).map(p=>'<div class="avatar '+p.party+'" title="'+esc(p.name)+' · '+esc(p.company)+(p.online?' (online)':' (not joined)')+'">'+initials(p.name)+'<span class="st'+(p.online?' on':'')+'"></span></div>').join('');
   const pend=s.pending;
   $('pending').hidden=!pend;
-  if(pend) $('pending').innerHTML='Waiting for <b>'+esc(COMPANY[pend.owner])+'</b> to approve '+esc(pend.by_name)+'’s request: “'+esc(pend.request)+'” — say “yes, go ahead”.';
-  $('events').innerHTML=(s.events||[]).slice().reverse().map(e=>'<div class="ev '+esc(e.decision||e.kind)+'">'+esc(e.text)+(e.reason_code?' <code>'+esc(e.reason_code)+'</code>':'')+'</div>').join('')||'<div class="muted">Say “Meridian, can we see …” to request material.</div>';
-  $('transcript').innerHTML=(s.transcript||[]).slice().reverse().map(x=>'<div class="line"><b class="'+x.party+'">'+esc(x.name)+'</b> '+esc(x.text)+'</div>').join('')||'<div class="muted">No speech yet.</div>';
-  $('criteria').innerHTML=(s.criteria||[]).map(c=>'<div>'+(c.completed?'✅':'⬜')+' '+esc(c.object)+' '+(c.current_count||0)+'/'+c.target_count+'</div>').join('');
+  if(pend) $('pending').innerHTML='<b>Approval needed from '+esc(COMPANY[pend.owner])+'.</b> '+esc(pend.by_name)+' asked: “'+esc(pend.request)+'” — the owner says “yes, go ahead” to release it.';
+  const badge=e=>e.decision==='ALLOW'?'<span class="badge ALLOW">ALLOW</span>':e.decision==='DENY'?'<span class="badge DENY">DENY</span>':e.kind==='pending'?'<span class="badge WAIT">PENDING</span>':'<span class="badge">INFO</span>';
+  $('events').innerHTML=(s.events||[]).slice().reverse().map(e=>'<div class="ev">'+badge(e)+'<div>'+esc(e.text)+(e.reason_code?' <code>'+esc(e.reason_code)+'</code>':'')+'</div></div>').join('')||'<div class="empty">Say “Meridian, can we see …” to request material.</div>';
+  $('transcript').innerHTML=(s.transcript||[]).slice().reverse().map(x=>'<div class="line"><time>'+esc((x.t||'').slice(11,16))+'</time><span class="sp '+x.party+'">'+esc(x.name)+'</span>'+esc(x.text)+'</div>').join('')||'<div class="empty">No speech yet.</div>';
+  const cr=s.criteria||[]; const done=cr.filter(c=>c.completed).length;
+  $('critCount').textContent=done+' / '+cr.length; $('critBar').style.width=(cr.length?100*done/cr.length:0)+'%';
+  $('criteria').innerHTML=cr.map(c=>'<div><span>'+esc(c.object)+'</span><span class="'+(c.completed?'ok':'open')+'">'+(c.completed?'Verified':'Open')+' · '+(c.current_count||0)+'/'+c.target_count+'</span></div>').join('');
   if(s.ended) showEnded(s.ended);
 }
 init().catch(e=>{ $('who').textContent='Could not start: '+e.message+' (allow camera and microphone).'; });
