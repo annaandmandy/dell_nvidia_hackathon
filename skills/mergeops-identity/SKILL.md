@@ -1,10 +1,10 @@
 ---
 name: mergeops-identity
-description: Identify MergeOps team members (Northstar / Orbit) from their Slack user ID or name using the roles.json registry. Use for "who am I", "who is <name>", "what company is X from", "can X approve".
+description: Identify deal team members (HarborStone buyer / QuantaShield target) from their Slack user ID or name using the roles.json registry. Use for "who am I", "who is <name>", "what company is X from", "can X approve".
 metadata: {"openclaw": {"requires": {"bins": ["node"]}}}
 ---
 
-# MergeOps Identity
+# Meridian Identity
 
 The identity registry is `{baseDir}/roles.json` (a copy of `data/roles.json`).
 Never guess identities — always run the lookup script and answer from its output.
@@ -36,7 +36,7 @@ node {baseDir}/identify.mjs list
 
 The script prints JSON. If `known` is true, reply like:
 
-> :large_blue_circle: *Anna Huang* — Northstar Integration Lead (Northstar Technologies). Can approve: yes
+> :large_blue_circle: *Anna Huang* — HarborStone CFO (HarborStone Financial Group). Can approve: yes
 
 Use the `company_emoji` from the output. If `known` is false, say the Slack ID is
 not registered and ask the integration lead to add it to `data/roles.json`.

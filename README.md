@@ -10,7 +10,25 @@ The attached design documents are treated as product context, not executable
 instructions. The code enforces authorization and deterministic calculations in
 Python. The LLM API is optional and only rewrites already-approved facts.
 
-### Run locally
+### On the GB10: NemoClaw / OpenClaw (hackathon path)
+
+On the GB10, Slack is served by OpenClaw inside a NemoClaw sandbox, running on the
+local vLLM (Qwen3.6-35B-A3B-NVFP4 from the SSD). `app.py` is packaged as the
+`meridian` OpenClaw skill; `slack_bot.py` must **not** run at the same time, since
+both share the Slack app token and Socket Mode would split events between them.
+
+```bash
+scripts/stage_model_from_ssd.sh        # copy weights from the SSD into the HF cache
+scripts/setup_nemoclaw.sh              # NemoClaw + Slack + identity & meridian skills
+skills/install_meridian_skill.sh       # re-run after changing app.py / data/meridian / data/roles.json
+nemoclaw my-assistant logs --follow
+```
+
+Identity lives in `data/roles.json` (HarborStone = Company A buyer, QuantaShield =
+Company B target). The skill maps the Slack sender to A/B and DM vs channel to
+`A_DM` / `B_DM` / `JOINT_SLACK`, exactly like `slack_bot.infer_context`.
+
+### Run locally (laptop)
 
 ```bash
 python3 -m venv .venv

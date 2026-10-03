@@ -1,6 +1,6 @@
 #!/bin/bash
 # Install NemoClaw (OpenClaw + OpenShell + managed vLLM) on GB10, wire it to Slack,
-# and install the roles.json identity skill.
+# and install the identity + Meridian skills.
 # Pre-req: scripts/stage_model_from_ssd.sh (Qwen3.6-35B-A3B-NVFP4 into ~/.cache/huggingface).
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -31,6 +31,7 @@ else
 fi
 
 skills/install_identity_skill.sh "$SANDBOX"
+skills/install_meridian_skill.sh "$SANDBOX"
 
 nemoclaw "$SANDBOX" status
 nemoclaw "$SANDBOX" channels status --channel slack --wait --timeout 180 --json

@@ -36,19 +36,19 @@
     },
     {
       "resource_id": "A_BOARD_MEMO",
-      "title": "Alderon board memo with walk-away price",
+      "title": "HarborStone board memo with walk-away price",
       "owner": "A",
       "classification": "A_PRIVATE",
       "approved_for_joint": false,
-      "content": "Private Alderon board material. Demo content intentionally unavailable."
+      "content": "Private HarborStone board material. Demo content intentionally unavailable."
     },
     {
       "resource_id": "B_TOP_CUSTOMERS",
-      "title": "BlueMesa top customers and contract values",
+      "title": "QuantaShield top customers and contract values",
       "owner": "B",
       "classification": "B_PRIVATE",
       "approved_for_joint": false,
-      "content": "Private BlueMesa customer data. Demo content intentionally unavailable."
+      "content": "Private QuantaShield customer data. Demo content intentionally unavailable."
     },
     {
       "resource_id": "ATTACK_TAMPERED_COMPANY_A_DATA",
