@@ -22,6 +22,22 @@ python scripts/check_expected_results.py
 
 Fill `.env` with Slack tokens locally. Do not commit it.
 
+Run the unified meeting console:
+
+```bash
+python app.py
+```
+
+Open:
+
+```text
+http://127.0.0.1:5050/meeting
+```
+
+Use `Start Meeting` and `End Meeting`. Start Meeting runs continuous voice
+listening and continuous visual monitoring together; results go to Slack. End
+Meeting generates downloadable meeting summary and transcription files.
+
 Send a one-off webhook smoke test:
 
 ```bash
@@ -44,7 +60,7 @@ In a DM, message the bot directly.
 
 ### Continuous voice meeting monitor
 
-Run the local helper:
+The standalone voice page is still available for debugging:
 
 ```bash
 python app.py
@@ -69,7 +85,7 @@ approved financial summary into Slack.
 
 ### Continuous visual field inspection
 
-For webcam-based meeting and asset checks, run the local helper page:
+The standalone visual page is still available for debugging:
 
 ```bash
 python app.py

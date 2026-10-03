@@ -69,6 +69,9 @@ VOICE_MONITOR_STATE: dict[str, Any] = {
     "pending_resource_id": None,
     "pending_request_text": None,
     "last_action": None,
+    "transcript_segments": [],
+    "action_events": [],
+    "meeting_started_at": None,
 }
 
 app = Flask(__name__) if Flask else None
@@ -612,6 +615,29 @@ def post_to_slack(text: str) -> dict[str, Any]:
     return {"ok": False, "via": None, "error": "slack_not_configured"}
 
 
+def upload_meeting_files_to_slack(files: dict[str, Any]) -> dict[str, Any]:
+    if not (SLACK_BOT_TOKEN and SLACK_CHANNEL_ID):
+        return {"ok": False, "uploaded": [], "error": "slack_not_configured"}
+    try:
+        from slack_sdk import WebClient
+        client = WebClient(token=SLACK_BOT_TOKEN)
+        uploaded = []
+        for key, title in [("summary_path", "MergeOps meeting summary"), ("transcript_path", "MergeOps meeting transcription")]:
+            path = files.get(key)
+            if not path:
+                continue
+            response = client.files_upload_v2(
+                channel=SLACK_CHANNEL_ID,
+                file=path,
+                title=f"{title} — {Path(path).name}",
+                initial_comment=f"{title} generated at meeting end.",
+            )
+            uploaded.append({"file": Path(path).name, "ok": bool(response.get("ok"))})
+        return {"ok": all(item["ok"] for item in uploaded) if uploaded else False, "uploaded": uploaded, "error": None}
+    except Exception as exc:
+        return {"ok": False, "uploaded": [], "error": str(exc)}
+
+
 def synthesize_tts(text: str) -> str | None:
     if not OPENAI_API_KEY:
         return None
@@ -643,8 +669,34 @@ def transcribe_audio(audio_bytes: bytes, filename: str, mime_type: str) -> str:
 
 def detect_document_request(transcript: str) -> str | None:
     t = transcript.lower()
-    request_words = ("can i have", "can we have", "could i have", "could we have", "please send", "pull", "show", "share")
-    financial_words = ("financial statement", "financial statements", "financial summary", "finance statement", "2025 revenue", "ebitda")
+    request_words = (
+        "can i have",
+        "can we have",
+        "could i have",
+        "could we have",
+        "can i see",
+        "can we see",
+        "could i see",
+        "could we see",
+        "can i view",
+        "can we view",
+        "can i access",
+        "can we access",
+        "please send",
+        "pull",
+        "show",
+        "share",
+        "get",
+    )
+    financial_words = (
+        "financial statement",
+        "financial statements",
+        "financial report",
+        "financial summary",
+        "finance statement",
+        "2025 revenue",
+        "ebitda",
+    )
     if any(w in t for w in request_words) and any(w in t for w in financial_words):
         return "JOINT_FINANCIAL_SUMMARY"
     return None
@@ -654,6 +706,10 @@ def detect_consent(transcript: str) -> bool:
     t = re.sub(r"[^a-z0-9\s']", " ", transcript.lower())
     consent_phrases = (
         "yes",
+        "yeah",
+        "yep",
+        "ok",
+        "okay",
         "yes please",
         "yes you can",
         "sure",
@@ -698,6 +754,13 @@ def process_voice_transcript(transcript: str) -> dict[str, Any]:
     if not clean:
         return {"action": "silence", "posted_to_slack": False}
 
+    segments = VOICE_MONITOR_STATE.setdefault("transcript_segments", [])
+    segments.append({
+        "chunk": VOICE_MONITOR_STATE["chunk_count"],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "text": clean,
+    })
+
     requested_resource = detect_document_request(clean)
     consent = detect_consent(clean)
     action = "transcribed"
@@ -728,6 +791,14 @@ def process_voice_transcript(transcript: str) -> dict[str, Any]:
         VOICE_MONITOR_STATE["pending_request_text"] = None
 
     VOICE_MONITOR_STATE["last_action"] = action
+    if action != "transcribed":
+        VOICE_MONITOR_STATE.setdefault("action_events", []).append({
+            "chunk": VOICE_MONITOR_STATE["chunk_count"],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "action": action,
+            "text": clean,
+            "resource_id": requested_resource or VOICE_MONITOR_STATE.get("pending_resource_id"),
+        })
     audit({
         "decision": "ALLOW",
         "reason_code": "VOICE_MEETING_MONITOR",
@@ -741,6 +812,77 @@ def process_voice_transcript(transcript: str) -> dict[str, Any]:
         "posted_to_slack": slack.get("via") != "suppressed",
         "slack": slack,
         "pending_resource_id": VOICE_MONITOR_STATE.get("pending_resource_id"),
+    }
+
+
+def write_meeting_outputs(criteria: list[dict[str, Any]], visual_complete: bool) -> dict[str, Any]:
+    out_dir = DATA_DIR / "meetings"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    base = f"meeting_{stamp}"
+    transcript_path = out_dir / f"{base}_transcript.txt"
+    summary_path = out_dir / f"{base}_summary.md"
+
+    segments = VOICE_MONITOR_STATE.get("transcript_segments") or []
+    events = VOICE_MONITOR_STATE.get("action_events") or []
+    transcript_lines = []
+    for seg in segments:
+        transcript_lines.append(f"Speaker: {seg.get('text', '')}")
+    transcript_text = "\n".join(transcript_lines).strip() or "(No speech transcript captured.)"
+    transcript_path.write_text(transcript_text + "\n", encoding="utf-8")
+
+    documents_pulled = sorted({
+        str(e.get("resource_id"))
+        for e in events
+        if e.get("resource_id") and "pull_document" in str(e.get("action"))
+    })
+    requests = [e for e in events if "request" in str(e.get("action"))]
+    approvals = [e for e in events if "consent" in str(e.get("action"))]
+
+    summary_lines = [
+        "# MergeOps Meeting Summary",
+        "",
+        f"- Started: {VOICE_MONITOR_STATE.get('meeting_started_at') or 'unknown'}",
+        f"- Ended: {datetime.now(timezone.utc).isoformat()}",
+        f"- Voice chunks processed: {VOICE_MONITOR_STATE.get('chunk_count', 0)}",
+        f"- Visual frames processed: {VISUAL_MONITOR_STATE.get('frame_count', 0)}",
+        f"- Visual due diligence complete: {visual_complete}",
+        "",
+        "## Key Outcomes",
+    ]
+    if documents_pulled:
+        for resource_id in documents_pulled:
+            summary_lines.append(f"- Voice approval detected and `{resource_id}` was pulled into Slack.")
+    else:
+        summary_lines.append("- No approved document pull was completed.")
+
+    if requests:
+        summary_lines += ["", "## Document Requests"]
+        for event in requests:
+            summary_lines.append(f"- Speaker segment {event.get('chunk')}: {event.get('text')}")
+
+    if approvals:
+        summary_lines += ["", "## Approval Signals"]
+        for event in approvals:
+            summary_lines.append(f"- Speaker segment {event.get('chunk')}: {event.get('text')}")
+
+    summary_lines += ["", "## On-Site Due Diligence"]
+    for item in criteria:
+        mark = "complete" if item.get("completed") else "open"
+        summary_lines.append(
+            f"- {item.get('object')}: {item.get('current_count', 0)}/{item.get('target_count')} ({mark})"
+            + (f" — {item.get('evidence')}" if item.get("evidence") else "")
+        )
+
+    summary_lines += ["", "## Transcript File", f"- `{transcript_path.name}`"]
+    summary_path.write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+
+    return {
+        "transcript_path": str(transcript_path),
+        "summary_path": str(summary_path),
+        "transcript_url": f"/media/meetings/{transcript_path.name}",
+        "summary_url": f"/media/meetings/{summary_path.name}",
+        "documents_pulled": documents_pulled,
     }
 
 
@@ -872,7 +1014,11 @@ def handle_request(text: str, ctx: Context) -> dict[str, Any]:
 if app:
     @app.route("/")
     def index() -> str:
-        return UI_HTML
+        return MEETING_HTML
+
+    @app.route("/meeting")
+    def meeting_page() -> str:
+        return MEETING_HTML
 
     @app.route("/vision")
     def vision_page() -> str:
@@ -964,6 +1110,16 @@ if app:
             criteria = parse_visual_criteria_text(body.get("text", ""))
         return jsonify({"criteria": criteria, "complete": criteria_complete(criteria), "finalized": None})
 
+    @app.route("/api/visual-criteria/reset", methods=["POST"])
+    def visual_criteria_reset():
+        criteria = save_visual_criteria(load_visual_criteria(), reset_progress=True)
+        VISUAL_MONITOR_STATE["last_signature"] = None
+        VISUAL_MONITOR_STATE["last_slack_at"] = None
+        VISUAL_MONITOR_STATE["frame_count"] = 0
+        VISUAL_MONITOR_STATE["finalized"] = None
+        audit({"decision": "ALLOW", "reason_code": "VISUAL_CRITERIA_RESET"})
+        return jsonify({"ok": True, "criteria": criteria, "complete": False, "finalized": None})
+
     @app.route("/api/visual-monitor/stop", methods=["POST"])
     def stop_visual_monitor():
         body = request.json or {}
@@ -1013,13 +1169,55 @@ if app:
     @app.route("/api/voice-reset", methods=["POST"])
     def voice_reset():
         VOICE_MONITOR_STATE.update({
-            "active": False,
+            "active": True,
             "chunk_count": 0,
             "pending_resource_id": None,
             "pending_request_text": None,
             "last_action": "reset",
+            "transcript_segments": [],
+            "action_events": [],
+            "meeting_started_at": datetime.now(timezone.utc).isoformat(),
         })
         return jsonify({"ok": True, "voice": VOICE_MONITOR_STATE})
+
+    @app.route("/api/meeting-end", methods=["POST"])
+    def meeting_end():
+        VOICE_MONITOR_STATE["active"] = False
+        criteria = load_visual_criteria()
+        visual_complete = criteria_complete(criteria)
+        files = write_meeting_outputs(criteria, visual_complete)
+        file_upload = upload_meeting_files_to_slack(files)
+        text = (
+            "*MergeOps Meeting Monitor ended*\n"
+            f"Voice chunks processed: `{VOICE_MONITOR_STATE.get('chunk_count', 0)}`\n"
+            f"Visual frames processed: `{VISUAL_MONITOR_STATE.get('frame_count', 0)}`\n"
+            f"Pending voice request: `{VOICE_MONITOR_STATE.get('pending_resource_id') or 'none'}`\n"
+            f"Visual audit complete: `{visual_complete}`\n"
+            f"Documents pulled: `{', '.join(files['documents_pulled']) if files['documents_pulled'] else 'none'}`\n"
+            f"Summary file: `{Path(files['summary_path']).name}`\n"
+            f"Transcript file: `{Path(files['transcript_path']).name}`\n"
+            f"Slack file upload: `{'ok' if file_upload.get('ok') else 'fallback'}`"
+        )
+        slack = post_to_slack(text)
+        audit({
+            "decision": "ALLOW",
+            "reason_code": "MEETING_MONITOR_END",
+            "voice_chunks": VOICE_MONITOR_STATE.get("chunk_count", 0),
+            "visual_frames": VISUAL_MONITOR_STATE.get("frame_count", 0),
+            "slack_ok": slack.get("ok"),
+        })
+        return jsonify({
+            "ok": True,
+            "slack": slack,
+            "files": files,
+            "file_upload": file_upload,
+            "voice": VOICE_MONITOR_STATE,
+            "visual": {
+                "frame_count": VISUAL_MONITOR_STATE.get("frame_count", 0),
+                "criteria": criteria,
+                "complete": visual_complete,
+            },
+        })
 
     @app.route("/media/tts/<name>")
     def tts_media(name: str):
@@ -1027,6 +1225,14 @@ if app:
         if not path.exists() or path.suffix != ".mp3":
             return jsonify({"error": "not found"}), 404
         return send_file(path, mimetype="audio/mpeg")
+
+    @app.route("/media/meetings/<name>")
+    def meeting_media(name: str):
+        path = DATA_DIR / "meetings" / name
+        if not path.exists() or path.suffix not in {".txt", ".md"}:
+            return jsonify({"error": "not found"}), 404
+        mimetype = "text/markdown" if path.suffix == ".md" else "text/plain"
+        return send_file(path, mimetype=mimetype, as_attachment=True)
 
 
     @app.route("/api/health")
@@ -1042,6 +1248,293 @@ if app:
             "tts_model": TTS_MODEL,
             "slack_channel_configured": bool(SLACK_CHANNEL_ID or SLACK_WEBHOOK_URL),
         })
+
+
+MEETING_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MergeOps Meeting Monitor</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f4f5f7;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+main{max-width:1440px;margin:0 auto;padding:24px}
+h1{font-size:28px;line-height:1.1;margin:0;color:#111827}.sub{color:#5f6b7a;margin:7px 0 0;font-size:14px}
+.top{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:18px}
+.bar{display:flex;gap:10px;flex-wrap:wrap}.bar button{min-width:146px}
+button{border:1px solid #2563eb;background:#2563eb;color:white;padding:11px 14px;border-radius:8px;font-weight:700;cursor:pointer;box-shadow:0 1px 2px rgba(15,23,42,.08)}
+button:hover{background:#1d4ed8}button.danger{background:#dc2626;border-color:#dc2626}button.danger:hover{background:#b91c1c}
+.grid{display:grid;grid-template-columns:minmax(680px,2fr) minmax(360px,1fr);gap:18px;align-items:start}
+.panel{background:#fff;border:1px solid #d9e2ec;border-radius:10px;padding:16px;box-shadow:0 10px 28px rgba(31,41,55,.08)}
+.video-panel{padding:10px;background:#15171c;border-color:#15171c;box-shadow:0 14px 34px rgba(0,0,0,.18)}
+video,canvas{width:100%;background:#111827;border-radius:8px;aspect-ratio:16/9;min-height:620px;max-height:calc(100vh - 150px);object-fit:cover}
+canvas{display:none}
+.status{font-size:14px;color:#2563eb;margin:8px 0 16px;min-height:20px}
+.small{font-size:12px;color:#6b7280}
+.pill{display:inline-block;margin:8px 6px 0 0;padding:5px 9px;border-radius:999px;background:#232832;color:#dbeafe;font-size:12px;border:1px solid #343b49}
+.panel h2{font-size:16px;margin:0;color:#111827}
+.audit{display:grid;gap:8px;margin-bottom:12px}
+.audit-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;border:1px solid #d7dee8;background:#f8fafc;border-radius:8px;padding:10px}
+.audit-row.done{border-color:#9bd7b5;background:#f0fbf5}.audit-row.missing{border-color:#f2d49b;background:#fffaf0}
+.audit-label{font-weight:700;color:#1f2937}.audit-evidence{font-size:12px;color:#64748b;margin-top:3px}
+.audit-count{font-variant-numeric:tabular-nums;color:#334155;font-size:12px;font-weight:700}
+.right-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+.right-head button{min-width:auto;padding:8px 10px}
+.transcript{min-height:240px;max-height:340px;overflow:auto;background:#fbfdff;border:1px solid #dbe4ef;border-radius:8px;padding:12px;margin-top:10px}
+.utterance{border-bottom:1px solid #e5edf5;padding:9px 0;line-height:1.45;color:#172033}.utterance:last-child{border-bottom:0}
+.chunk{font-size:12px;color:#64748b;margin-right:6px;font-weight:700}
+.files{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}.files a{color:#075985;text-decoration:none;border:1px solid #bae6fd;border-radius:8px;padding:8px 10px;background:#f0f9ff;font-weight:700}
+.event{font-size:12px;color:#475569;margin-top:8px;min-height:18px}
+.side{display:grid;gap:14px}
+@media(max-width:1040px){.top{display:block}.bar{margin-top:14px}.grid{grid-template-columns:1fr}video,canvas{min-height:360px}}
+</style>
+</head>
+<body><main>
+<div class="top">
+  <div>
+    <h1>MergeOps Meeting Monitor</h1>
+    <div class="sub">Continuous voice, visual due diligence, and Slack-ready meeting artifacts.</div>
+  </div>
+  <div class="bar">
+    <button onclick="startMeeting()">Start Meeting</button>
+    <button onclick="openDueDiligence()">On-Site Due Diligence</button>
+    <button class="danger" onclick="endMeeting()">End Meeting</button>
+  </div>
+</div>
+<div id="status" class="status">Stopped.</div>
+<div class="grid">
+<section class="panel video-panel">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+  <div class="small">
+    <span class="pill">voice chunk: 3s</span>
+    <span class="pill">visual frame: 4s</span>
+    <span class="pill">Slack on actions/final states</span>
+  </div>
+</section>
+<section class="side">
+<div class="panel">
+  <div class="right-head">
+    <h2>On-Site Due Diligence</h2>
+    <div>
+      <button onclick="resetDueDiligence()">Reset</button>
+      <button onclick="triggerDueDiligence()">Check now</button>
+    </div>
+  </div>
+  <div id="auditList" class="audit">
+    <div class="audit-row missing"><div><div class="audit-label">Physical audit loading...</div></div><div class="audit-count">--</div></div>
+  </div>
+  <div class="small">Physical checks run continuously after Start Meeting and update this panel.</div>
+</div>
+<div class="panel">
+  <h2>Live Transcription</h2>
+  <div id="transcript" class="transcript"><div class="small">Ready. Click Start Meeting.</div></div>
+  <div id="event" class="event"></div>
+  <div id="files" class="files"></div>
+</div>
+</section>
+</div>
+</main>
+<script>
+const video=document.getElementById('video');
+const canvas=document.getElementById('canvas');
+const statusEl=document.getElementById('status');
+const transcriptEl=document.getElementById('transcript');
+const eventEl=document.getElementById('event');
+const filesEl=document.getElementById('files');
+const auditList=document.getElementById('auditList');
+let meeting=false;
+let mediaStream=null;
+let audioStream=null;
+let recorder=null;
+let voiceTimer=null;
+let visualTimer=null;
+let voiceChunk=0;
+let visualFrame=0;
+let voiceInFlight=false;
+let visualInFlight=false;
+let lastVoice={};
+let lastVisual={};
+let transcriptLines=[];
+
+async function loadDueDiligence(){
+  try{
+    const res=await fetch('/api/visual-criteria');
+    const data=await res.json();
+    renderAudit(data.criteria||[], data.complete, data.finalized);
+  }catch(err){
+    auditList.innerHTML='<div class="audit-row missing"><div><div class="audit-label">Could not load audit checklist</div><div class="audit-evidence">'+err+'</div></div><div class="audit-count">!</div></div>';
+  }
+}
+
+async function resetDueDiligence(){
+  const res=await fetch('/api/visual-criteria/reset',{method:'POST'});
+  const data=await res.json();
+  lastVisual={reset_due_diligence:data};
+  renderAudit(data.criteria||[], false, null);
+  render();
+  statusEl.textContent='On-site due diligence reset.';
+}
+
+function renderAudit(criteria, complete, finalized){
+  if(!criteria.length){
+    auditList.innerHTML='<div class="audit-row missing"><div><div class="audit-label">No criteria configured</div></div><div class="audit-count">--</div></div>';
+    return;
+  }
+  auditList.innerHTML=criteria.map(c=>{
+    const cls=c.completed?'done':'missing';
+    const mark=c.completed?'done':'pending';
+    return `<div class="audit-row ${cls}">
+      <div>
+        <div class="audit-label">${escapeHtml(c.object)}</div>
+        <div class="audit-evidence">${escapeHtml(c.evidence || c.description || '')}</div>
+      </div>
+      <div class="audit-count">${c.current_count || 0}/${c.target_count} ${mark}</div>
+    </div>`;
+  }).join('');
+}
+
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
+function openDueDiligence(){
+  loadDueDiligence();
+  auditList.scrollIntoView({behavior:'smooth',block:'center'});
+}
+
+async function startMeeting(){
+  meeting=true;
+  transcriptLines=[];
+  transcriptEl.innerHTML='<div class="small">Listening...</div>';
+  filesEl.innerHTML='';
+  eventEl.textContent='Starting meeting monitors...';
+  await fetch('/api/voice-reset',{method:'POST'});
+  mediaStream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:1280},height:{ideal:720}},audio:false});
+  audioStream=await navigator.mediaDevices.getUserMedia({audio:true,video:false});
+  video.srcObject=mediaStream;
+  statusEl.textContent='Meeting active. Listening and watching continuously.';
+  await loadDueDiligence();
+  runVoiceLoop();
+  runVisualLoop();
+}
+
+async function endMeeting(){
+  meeting=false;
+  clearTimeout(voiceTimer);
+  clearTimeout(visualTimer);
+  if(recorder && recorder.state !== 'inactive') recorder.stop();
+  stopTracks(mediaStream);
+  stopTracks(audioStream);
+  statusEl.textContent='Ending meeting...';
+  const res=await fetch('/api/meeting-end',{method:'POST'});
+  const data=await res.json();
+  renderFiles(data.files || {});
+        const upload=data.file_upload && data.file_upload.ok ? ' Files uploaded to Slack.' : ' Local files generated; Slack file upload fallback used.';
+        eventEl.textContent='Meeting ended. Summary and transcription files generated.'+upload;
+  statusEl.textContent='Meeting ended. Summary posted to Slack.';
+}
+
+function stopTracks(stream){
+  if(stream){ stream.getTracks().forEach(t=>t.stop()); }
+}
+
+function pickMimeType(){
+  const types=['audio/webm;codecs=opus','audio/webm','audio/mp4'];
+  return types.find(t=>MediaRecorder.isTypeSupported(t)) || '';
+}
+
+function runVoiceLoop(){
+  if(!meeting || voiceInFlight) return;
+  voiceInFlight=true;
+  const chunks=[];
+  const mimeType=pickMimeType();
+  recorder=mimeType ? new MediaRecorder(audioStream,{mimeType}) : new MediaRecorder(audioStream);
+  recorder.ondataavailable=e=>{ if(e.data && e.data.size>0) chunks.push(e.data); };
+  recorder.onstop=async()=>{
+    try{
+      if(chunks.length){
+        voiceChunk += 1;
+        const blob=new Blob(chunks,{type:recorder.mimeType || 'audio/webm'});
+        const form=new FormData();
+        form.append('audio', blob, 'meeting-'+voiceChunk+'.webm');
+        const res=await fetch('/api/voice-chunk',{method:'POST',body:form});
+        lastVoice=await res.json();
+        if(lastVoice.transcript){ addTranscript(voiceChunk,lastVoice.transcript); }
+        if(lastVoice.action && lastVoice.action !== 'transcribed' && lastVoice.action !== 'silence'){
+          eventEl.textContent='Voice action: '+lastVoice.action;
+        }
+        render();
+      }
+    }catch(err){ lastVoice={error:String(err)}; render(); }
+    finally{
+      voiceInFlight=false;
+      if(meeting) voiceTimer=setTimeout(runVoiceLoop,250);
+    }
+  };
+  recorder.start();
+  setTimeout(()=>{ if(recorder && recorder.state !== 'inactive') recorder.stop(); },3000);
+}
+
+async function runVisualLoop(){
+  if(!meeting || visualInFlight) return;
+  visualInFlight=true;
+  try{
+    const w=video.videoWidth||1280, h=video.videoHeight||720;
+    canvas.width=w; canvas.height=h;
+    canvas.getContext('2d').drawImage(video,0,0,w,h);
+    visualFrame += 1;
+    const image_data_url=canvas.toDataURL('image/jpeg',0.82);
+    const res=await fetch('/api/visual-inspection',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({image_data_url,questions:'Continuous meeting monitor: check current configured visual audit criteria.',monitoring:true,tts:false})
+    });
+    lastVisual=await res.json();
+    if(lastVisual.criteria){ renderAudit(lastVisual.criteria, lastVisual.monitor && lastVisual.monitor.complete, null); }
+    render();
+  }catch(err){ lastVisual={error:String(err)}; render(); }
+  finally{
+    visualInFlight=false;
+    if(meeting) visualTimer=setTimeout(runVisualLoop,4000);
+  }
+}
+
+async function triggerDueDiligence(){
+  if(!mediaStream){
+    mediaStream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:1280},height:{ideal:720}},audio:false});
+    video.srcObject=mediaStream;
+  }
+  await runVisualLoop();
+  openDueDiligence();
+}
+
+function render(){
+  statusEl.textContent=meeting
+    ? `Meeting active. Voice chunks: ${voiceChunk}. Visual frames: ${visualFrame}.`
+    : 'Stopped.';
+  if(lastVisual && lastVisual.monitor && lastVisual.monitor.complete){
+    eventEl.textContent='On-site due diligence complete.';
+  }
+}
+
+function addTranscript(chunk,text){
+  const clean=String(text||'').trim();
+  if(!clean) return;
+  transcriptLines.push({chunk,text:clean});
+  transcriptEl.innerHTML=transcriptLines.map(item=>`<div class="utterance"><span class="chunk">Speaker</span>${escapeHtml(item.text)}</div>`).join('');
+  transcriptEl.scrollTop=transcriptEl.scrollHeight;
+}
+
+function renderFiles(files){
+  const links=[];
+  if(files.summary_url){ links.push(`<a href="${files.summary_url}" download>Download summary</a>`); }
+  if(files.transcript_url){ links.push(`<a href="${files.transcript_url}" download>Download transcription</a>`); }
+  filesEl.innerHTML=links.join('');
+}
+loadDueDiligence();
+</script></body></html>"""
 
 
 UI_HTML = """<!doctype html>
@@ -1282,7 +1775,7 @@ pre{white-space:pre-wrap;word-break:break-word;min-height:360px;background:#0b10
 <div class="sub">Continuous meeting listener. Voice requests and approvals are converted into Slack channel actions.</div>
 <section class="panel">
 <div class="row">
-  <div><label>Chunk seconds</label><input id="chunkSeconds" type="number" min="2" max="12" value="4"></div>
+  <div><label>Chunk seconds</label><input id="chunkSeconds" type="number" min="2" max="12" value="3"></div>
   <div>
     <button onclick="startListening()">Start listening</button>
     <button class="danger" onclick="stopListening()">Stop</button>
@@ -1332,7 +1825,7 @@ async function resetVoice(){
 
 async function recordOneChunk(){
   if(!listening) return;
-  const seconds=Math.max(2, Number(document.getElementById('chunkSeconds').value||4));
+  const seconds=Math.max(2, Number(document.getElementById('chunkSeconds').value||3));
   const chunks=[];
   const mimeType=pickMimeType();
   recorder=mimeType ? new MediaRecorder(stream,{mimeType}) : new MediaRecorder(stream);

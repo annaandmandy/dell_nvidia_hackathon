@@ -6,7 +6,7 @@
     "description": "At least 2 people in meeting visible.",
     "current_count": 2,
     "completed": true,
-    "evidence": "1 person visible in the image."
+    "evidence": "One person visible in the frame."
   },
   {
     "id": "metal_cup_or_bottle",
@@ -15,7 +15,7 @@
     "description": "At least 1 metal cup or bottle visible.",
     "current_count": 1,
     "completed": true,
-    "evidence": "1 metal bottle visible."
+    "evidence": "No metal cup or bottle visible."
   },
   {
     "id": "ai_host_workstation_server",
