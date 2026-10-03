@@ -15,6 +15,7 @@ import csv
 import hashlib
 import importlib.util
 import io
+import ipaddress
 import json
 import os
 import re
@@ -984,6 +985,43 @@ def apply_visual_results_to_criteria(result: dict[str, Any]) -> list[dict[str, A
     return criteria
 
 
+def is_visual_criteria_command(text: str) -> bool:
+    t = text.lower()
+    return (
+        "visual" in t
+        or "criteria" in t
+        or "condition" in t
+        or "审查" in text
+        or "条件" in text
+        or "检查" in text
+    ) and (
+        "set" in t
+        or "update" in t
+        or "change" in t
+        or "修改" in text
+        or "设置" in text
+        or "设定" in text
+    )
+
+
+def is_show_visual_criteria_command(text: str) -> bool:
+    t = text.lower()
+    return (
+        ("show" in t or "list" in t or "当前" in text or "查看" in text)
+        and ("criteria" in t or "condition" in t or "条件" in text or "审查" in text)
+    )
+
+
+def format_criteria_response(criteria) -> str:
+    return (
+        "*Meridian visual audit criteria updated.*\n"
+        "The Chrome monitoring UI will refresh automatically.\n\n"
+        f"{format_criteria_table(criteria)}\n\n"
+        "Example update command:\n"
+        "`@mergeops set visual criteria: people=2; metal cup=1; AI host=1`"
+    )
+
+
 def criteria_complete(criteria: list[dict[str, Any]]) -> bool:
     return bool(criteria) and all(bool(c.get("completed")) for c in criteria)
 
@@ -1098,7 +1136,6 @@ def detect_consent(transcript: str) -> bool:
         "i approve",
         "we approve",
         "you can share",
-        "please share",
     )
     return any(re.search(rf"\b{re.escape(phrase)}\b", t) for phrase in consent_phrases)
 
@@ -1157,7 +1194,31 @@ def process_voice_transcript(transcript: str) -> dict[str, Any]:
     }
 
 
+# The OpenClaw sandbox reaches this host as host.openshell.internal (a Docker bridge address).
+# Loopback gets everything; the bridge only gets the endpoints the skill needs; anyone else
+# (e.g. the venue Wi-Fi when bound to 0.0.0.0) is refused, since /api/ask trusts the
+# organization/channel it is given.
+# Subnet of the openshell-docker network (docker network inspect openshell-docker).
+SANDBOX_NETWORK = ipaddress.ip_network(os.environ.get("MERIDIAN_SANDBOX_NETWORK", "172.18.0.0/16"))
+SANDBOX_PATHS = {"/api/visual-criteria"}
+
+
+def request_allowed(remote_addr: str | None, path: str) -> bool:
+    try:
+        addr = ipaddress.ip_address(remote_addr or "")
+    except ValueError:
+        return False
+    if addr.is_loopback:
+        return True
+    return addr in SANDBOX_NETWORK and path in SANDBOX_PATHS
+
+
 if app:
+    @app.before_request
+    def restrict_remote_callers():
+        if not request_allowed(request.remote_addr, request.path):
+            return jsonify({"error": "forbidden"}), 403
+
     @app.route("/")
     def index() -> str:
         return UI_HTML
@@ -1676,4 +1737,5 @@ if __name__ == "__main__":
     if not app:
         raise SystemExit("Flask is not installed. Run: pip install -r requirements.txt")
     debug = os.environ.get("MERIDIAN_DEBUG") == "1"
-    app.run(host="127.0.0.1", port=5050, debug=debug, use_reloader=False)
+    # 0.0.0.0 so the sandbox can reach /api/visual-criteria; request_allowed() limits who gets what.
+    app.run(host=os.environ.get("MERIDIAN_BIND", "0.0.0.0"), port=5050, debug=debug, use_reloader=False)

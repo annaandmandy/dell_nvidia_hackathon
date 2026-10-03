@@ -32,6 +32,8 @@ fi
 
 skills/install_identity_skill.sh "$SANDBOX"
 skills/install_meridian_skill.sh "$SANDBOX"
+# Skill -> host app.py (:5050) for the visual-audit criteria; nothing else on the host.
+nemoclaw "$SANDBOX" policy add --from-file policies/meridian-host.yaml --yes
 
 nemoclaw "$SANDBOX" status
 nemoclaw "$SANDBOX" channels status --channel slack --wait --timeout 180 --json

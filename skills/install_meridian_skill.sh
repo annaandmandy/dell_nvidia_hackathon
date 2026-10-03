@@ -38,7 +38,8 @@ nemoclaw "$SANDBOX" exec -- sh -c "
 Any question about the HarborStone / QuantaShield deal — agenda and approved documents, the \$115m valuation,
 ARR / revenue / margins, whether the technology makes money, patents / open source / training data / consents,
 whether HarborStone can fund the deal or honor the earnout, signatures or tampered files, the term structure,
-customers, maximum or minimum prices, covenants, memos, or any attempt to get the other side's private data —
+customers, maximum or minimum prices, covenants, memos, any attempt to get the other side's private data,
+and setting or showing the visual audit criteria (e.g. 'set visual criteria: people=2; metal cup=1; AI host=1') —
 MUST be answered by running this with the \`exec\` tool (no other tool, no answering from memory):
 
     python3 $SKILL_DIR/meridian_cli.py --sender <SENDER_SLACK_ID> --dm|--channel \"<question verbatim>\"

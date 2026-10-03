@@ -1,0 +1,24 @@
+# Lets the Meridian skill (python3 in the sandbox) read/update the visual-audit criteria held by
+# app.py on the host (:5050). Nothing else on the host is reachable through this preset, and
+# app.py additionally refuses any other path from the sandbox network.
+preset:
+  name: meridian-host
+  description: "Meridian skill -> host app.py visual-criteria API"
+
+network_policies:
+  meridian_host:
+    name: meridian_host
+    endpoints:
+      - host: host.openshell.internal
+        port: 5050
+        protocol: rest
+        enforcement: enforce
+        allowed_ips:
+          # OpenShell's SSRF guard rejects private host-gateway IPs unless allowlisted.
+          - 172.18.0.0/16   # openshell-docker bridge (host.openshell.internal)
+        rules:
+          - allow: { method: GET, path: "/api/visual-criteria" }
+          - allow: { method: POST, path: "/api/visual-criteria" }
+    binaries:
+      - { path: /usr/bin/python3 }
+      - { path: /usr/bin/python3.13 }

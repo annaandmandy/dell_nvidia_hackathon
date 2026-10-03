@@ -13,6 +13,7 @@ import argparse
 import json
 import os
 import sys
+import urllib.request
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -20,8 +21,21 @@ os.environ["MERIDIAN_LLM_URL"] = "disabled"  # llm_polish -> deterministic fallb
 os.environ.pop("OPENAI_API_KEY", None)
 sys.path.insert(0, str(HERE))
 
-from app import Context, handle_request  # noqa: E402
+from app import (Context, format_criteria_response, format_criteria_table, handle_request,  # noqa: E402
+                 is_show_visual_criteria_command, is_visual_criteria_command)
 from meridian_format import format_response  # noqa: E402
+
+# Visual-audit criteria live in app.py on the host (the /vision page reads them), reached through
+# the meridian-host OpenShell policy. Parsing happens host-side, so both sides agree.
+HOST_API = os.environ.get("MERIDIAN_HOST_API", "http://host.openshell.internal:5050")
+
+
+def host_criteria(text: str | None = None) -> list[dict]:
+    data = None if text is None else json.dumps({"text": text}).encode()
+    req = urllib.request.Request(f"{HOST_API}/api/visual-criteria", data=data,
+                                 headers={"Content-Type": "application/json"}, method="POST" if data else "GET")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())["criteria"]
 
 
 def infer_context(sender: str, is_dm: bool) -> Context:
@@ -45,10 +59,18 @@ def main() -> None:
     p.add_argument("question", nargs="+")
     args = p.parse_args()
 
+    question = " ".join(args.question)
+    if is_visual_criteria_command(question):
+        print(format_criteria_response(host_criteria(question)))
+        return
+    if is_show_visual_criteria_command(question):
+        print("*Current Meridian visual audit criteria:*\n" + format_criteria_table(host_criteria()))
+        return
+
     ctx = infer_context(args.sender, args.dm)
     if args.camera:
         ctx = Context(actor_id=args.sender, organization="NEUTRAL", channel_type="CAMERA", session_id="openclaw")
-    result = handle_request(" ".join(args.question), ctx)
+    result = handle_request(question, ctx)
     print(format_response(result))
     print(f"\n_context: org={ctx.organization} channel={ctx.channel_type}_")
 

@@ -18,7 +18,9 @@ from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-from app import Context, handle_request, load_visual_criteria, parse_visual_criteria_text, format_criteria_table
+from app import (Context, format_criteria_response, format_criteria_table, handle_request,
+                 is_show_visual_criteria_command, is_visual_criteria_command, load_visual_criteria,
+                 parse_visual_criteria_text)
 from meridian_format import format_response
 
 load_dotenv()
@@ -80,43 +82,6 @@ def infer_context(event: dict[str, Any]) -> Context:
         organization=organization,
         channel_type=channel_type,
         session_id=channel_id,
-    )
-
-
-def is_visual_criteria_command(text: str) -> bool:
-    t = text.lower()
-    return (
-        "visual" in t
-        or "criteria" in t
-        or "condition" in t
-        or "审查" in text
-        or "条件" in text
-        or "检查" in text
-    ) and (
-        "set" in t
-        or "update" in t
-        or "change" in t
-        or "修改" in text
-        or "设置" in text
-        or "设定" in text
-    )
-
-
-def is_show_visual_criteria_command(text: str) -> bool:
-    t = text.lower()
-    return (
-        ("show" in t or "list" in t or "当前" in text or "查看" in text)
-        and ("criteria" in t or "condition" in t or "条件" in text or "审查" in text)
-    )
-
-
-def format_criteria_response(criteria) -> str:
-    return (
-        "*Meridian visual audit criteria updated.*\n"
-        "The Chrome monitoring UI will refresh automatically.\n\n"
-        f"{format_criteria_table(criteria)}\n\n"
-        "Example update command:\n"
-        "`@mergeops set visual criteria: people=2; metal cup=1; AI host=1`"
     )
 
 
