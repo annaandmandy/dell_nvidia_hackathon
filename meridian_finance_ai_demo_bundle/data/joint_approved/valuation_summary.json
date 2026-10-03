@@ -1,0 +1,36 @@
+{
+  "assessment": "The buyer's $90m potential value is defensible but shifts execution risk to the seller. The startup's $115m cash request exceeds the risk-adjusted standalone range and assigns most strategic value to the seller. A $100m headline structure allocates commercial and IP risks to the milestones that can resolve them.",
+  "buyer_initial_structure": {
+    "cash_at_close_usd_m": 72.0,
+    "earnout_usd_m": 18.0,
+    "headline_ev_usd_m": 90.0
+  },
+  "classification": "JOINT_APPROVED",
+  "current_arr_method_usd_m": {
+    "high": 88.5,
+    "low": 64.9,
+    "multiples": "5.5x-7.5x 2025 ending ARR"
+  },
+  "dcf_enterprise_value_usd_m": 49.4,
+  "five_year_net_synergy_npv_usd_m": 15.1,
+  "forward_revenue_method_usd_m": {
+    "high": 115.5,
+    "low": 82.5,
+    "multiples": "5.0x-7.0x 2026E revenue"
+  },
+  "neutral_structure": {
+    "cash_to_sellers_at_close_usd_m": 82.0,
+    "employee_retention_pool_outside_ev_usd_m": 5.0,
+    "headline_ev_usd_m": 100.0,
+    "ip_compliance_escrow_usd_m": 5.0,
+    "performance_earnout_usd_m": 13.0
+  },
+  "risk_adjusted_standalone_range_usd_m": [
+    69.8,
+    92.2
+  ],
+  "startup_request": {
+    "cash_at_close_usd_m": 115.0,
+    "headline_ev_usd_m": 115.0
+  }
+}

@@ -1,0 +1,63 @@
+{
+  "resources": [
+    {
+      "resource_id": "MEETING_AGENDA",
+      "title": "Joint diligence meeting agenda",
+      "owner": "NEUTRAL",
+      "classification": "PUBLIC",
+      "approved_for_joint": true,
+      "content": "Agenda: approved document list, joint financial summary, valuation bridge, disclosure controls, audit trail."
+    },
+    {
+      "resource_id": "JOINT_FINANCIAL_SUMMARY",
+      "title": "Joint approved financial summary",
+      "owner": "JOINT",
+      "classification": "JOINT_APPROVED",
+      "approved_for_joint": true,
+      "signature_status": "valid",
+      "payload_hash": "sha256:joint-financial-summary-demo",
+      "approval_timestamp": "2026-10-03T09:30:00-04:00",
+      "facts": {
+        "company_a": {
+          "revenue_m": 132.0,
+          "ebitda_m": 14.7,
+          "cash_m": 18.0,
+          "debt_m": 34.0,
+          "employees": 280
+        },
+        "company_b": {
+          "revenue_m": 45.0,
+          "ebitda_m": 5.7,
+          "cash_m": 7.0,
+          "debt_m": 3.0,
+          "employees": 150
+        }
+      }
+    },
+    {
+      "resource_id": "A_BOARD_MEMO",
+      "title": "Alderon board memo with walk-away price",
+      "owner": "A",
+      "classification": "A_PRIVATE",
+      "approved_for_joint": false,
+      "content": "Private Alderon board material. Demo content intentionally unavailable."
+    },
+    {
+      "resource_id": "B_TOP_CUSTOMERS",
+      "title": "BlueMesa top customers and contract values",
+      "owner": "B",
+      "classification": "B_PRIVATE",
+      "approved_for_joint": false,
+      "content": "Private BlueMesa customer data. Demo content intentionally unavailable."
+    },
+    {
+      "resource_id": "ATTACK_TAMPERED_COMPANY_A_DATA",
+      "title": "Tampered Company A approval package",
+      "owner": "A",
+      "classification": "A_PRIVATE",
+      "approved_for_joint": false,
+      "signature_status": "invalid",
+      "payload_hash": "sha256:tampered-company-a-data-demo"
+    }
+  ]
+}

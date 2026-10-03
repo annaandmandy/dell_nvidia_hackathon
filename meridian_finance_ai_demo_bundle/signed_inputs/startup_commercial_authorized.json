@@ -1,0 +1,65 @@
+{
+  "approved_at": "2026-10-03T13:30:00-04:00",
+  "approved_model_metrics": [
+    {
+      "customer_baseline": 0.72,
+      "evaluation_n": 48200,
+      "independent_validation": "yes",
+      "limitation": "portfolio mix differs from two target customer segments",
+      "metric": "AUROC",
+      "model": "Q-Risk Underwriter",
+      "period": "2025 holdout",
+      "startup_model": 0.84
+    },
+    {
+      "customer_baseline": 0.154,
+      "evaluation_n": 48200,
+      "independent_validation": "yes",
+      "limitation": "lower is better",
+      "metric": "Brier score",
+      "model": "Q-Risk Underwriter",
+      "period": "2025 holdout",
+      "startup_model": 0.118
+    },
+    {
+      "customer_baseline": 0.41,
+      "evaluation_n": 2600000,
+      "independent_validation": "yes",
+      "limitation": "three customers only",
+      "metric": "Precision at 80% recall",
+      "model": "Q-Fraud Graph",
+      "period": "2025 transactions",
+      "startup_model": 0.58
+    },
+    {
+      "customer_baseline": 0.071,
+      "evaluation_n": 2600000,
+      "independent_validation": "yes",
+      "limitation": "customer thresholds differ",
+      "metric": "False positive rate",
+      "model": "Q-Fraud Graph",
+      "period": "2025 transactions",
+      "startup_model": 0.048
+    }
+  ],
+  "classification": "JOINT_APPROVED",
+  "financial_and_commercial": {
+    "arr_growth_pct": 0.761,
+    "cac_payback_months": 18,
+    "cash_runway_months": 13.5,
+    "classification": "JOINT_APPROVED",
+    "ending_arr_usd_m": 11.8,
+    "expected_ebitda_break_even": "2027E",
+    "gross_margin_pct": 0.76,
+    "gross_retention_pct": 0.92,
+    "monthly_cash_burn_usd_m": 0.62,
+    "net_revenue_retention_pct": 1.16,
+    "paid_pilots": 5,
+    "production_customers": 9,
+    "profitability_assessment": "Evidence supports a plausible path to profitability, but it depends on converting the pipeline, retaining concentrated customers, and completing compliance work without delaying sales.",
+    "top_three_arr_concentration_pct": 0.432,
+    "weighted_pipeline_usd_m": 4.5
+  },
+  "issuer": "QuantaShield AI",
+  "schema_version": "2.0"
+}

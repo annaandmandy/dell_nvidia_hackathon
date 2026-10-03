@@ -1,0 +1,38 @@
+{
+  "approved_at": "2026-10-03T13:32:00-04:00",
+  "classification": "JOINT_APPROVED",
+  "ip_and_legal_summary": {
+    "additional_items": [
+      "two current employees need confirmatory IP assignments",
+      "freedom-to-operate review is incomplete outside the US",
+      "fair-lending validation needs broader segment coverage",
+      "AI marketing claim needs narrower substantiation"
+    ],
+    "classification": "JOINT_APPROVED",
+    "conclusion": "No automatic deal stop, but four closing conditions are required",
+    "high_or_critical_items": [
+      {
+        "deal_response": "$5m escrow; assignment and release before release",
+        "issue": "QS-102 contractor assignment",
+        "risk": "high"
+      },
+      {
+        "deal_response": "remove data, retrain affected adapter, independent validation",
+        "issue": "restricted FI-001 pilot data used in training",
+        "risk": "critical"
+      },
+      {
+        "deal_response": "replace or obtain commercial license before close",
+        "issue": "network-exposed AGPL component",
+        "risk": "high"
+      },
+      {
+        "deal_response": "obtain consents as closing condition",
+        "issue": "three customer change-of-control consents",
+        "risk": "high"
+      }
+    ]
+  },
+  "issuer": "QuantaShield AI",
+  "schema_version": "2.0"
+}

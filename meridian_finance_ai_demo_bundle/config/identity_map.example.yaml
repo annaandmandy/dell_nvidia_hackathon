@@ -1,0 +1,41 @@
+# Replace placeholders with immutable IDs from the demo workspace.
+users:
+  U_HFG_CFO:
+    organization: A
+    role: CFO
+  U_HFG_CTO:
+    organization: A
+    role: CTO
+  U_HFG_COUNSEL:
+    organization: A
+    role: COUNSEL
+  U_QS_CEO:
+    organization: B
+    role: CEO
+  U_QS_COUNSEL:
+    organization: B
+    role: COUNSEL
+  U_NEUTRAL_MODERATOR:
+    organization: NEUTRAL
+    role: MODERATOR
+
+channels:
+  C_SHARED_AI_ACQUISITION:
+    channel_type: JOINT_SLACK
+  D_HFG_PRIVATE:
+    channel_type: A_DM
+    organization: A
+  D_QS_PRIVATE:
+    channel_type: B_DM
+    organization: B
+
+meeting_principals:
+  hfg-cfo-passkey:
+    organization: A
+    role: CFO
+  qs-ceo-passkey:
+    organization: B
+    role: CEO
+  neutral-moderator-passkey:
+    organization: NEUTRAL
+    role: MODERATOR

@@ -1,0 +1,68 @@
+resources:
+  JOINT_AGENDA:
+    path: demo_documents/01_joint_transaction_agenda.pdf
+    owner: NEUTRAL
+    classification: JOINT_APPROVED
+  BUYER_PUBLIC_PROFILE:
+    path: demo_documents/02_buyer_public_profile.pdf
+    owner: A
+    classification: PUBLIC
+  STARTUP_PUBLIC_PROFILE:
+    path: demo_documents/03_startup_public_profile.pdf
+    owner: B
+    classification: PUBLIC
+  STARTUP_COMMERCIAL_SUMMARY:
+    path: demo_documents/04_startup_commercial_summary.pdf
+    owner: B
+    classification: JOINT_APPROVED
+    signature: signed_inputs/startup_commercial_authorized.sig.b64
+  VALUATION_ANALYSIS:
+    path: demo_documents/05_startup_valuation_analysis.pdf
+    owner: NEUTRAL
+    classification: JOINT_APPROVED
+    source_receipt: signed_inputs/calculation_receipt.json
+  TECHNOLOGY_PROFITABILITY:
+    path: demo_documents/06_technology_profitability_evidence.pdf
+    owner: B
+    classification: JOINT_APPROVED
+  IP_LEGAL_SUMMARY:
+    path: demo_documents/07_ip_legal_compliance_review.pdf
+    owner: B
+    classification: JOINT_APPROVED
+    signature: signed_inputs/startup_ip_authorized.sig.b64
+  BUYER_RELIABILITY_SUMMARY:
+    path: demo_documents/08_buyer_reliability_review.pdf
+    owner: A
+    classification: JOINT_APPROVED
+    signature: signed_inputs/buyer_reliability_authorized.sig.b64
+  BUYER_ACQUISITION_STRATEGY:
+    path: demo_documents/09_buyer_private_acquisition_strategy.pdf
+    owner: A
+    classification: A_PRIVATE
+  STARTUP_NEGOTIATION_POSITION:
+    path: demo_documents/10_startup_private_negotiation_memo.pdf
+    owner: B
+    classification: B_PRIVATE
+  JOINT_TERM_SHEET:
+    path: demo_documents/11_joint_risk_allocation_term_sheet.pdf
+    owner: NEUTRAL
+    classification: JOINT_APPROVED
+  ACCESS_POLICY:
+    path: demo_documents/12_information_access_policy.pdf
+    owner: NEUTRAL
+    classification: JOINT_APPROVED
+  VISUAL_JOINT_IP:
+    path: demo_documents/13_visual_joint_ip_summary.pdf
+    owner: B
+    classification: JOINT_APPROVED
+    marker: JOINT_IP_SUMMARY
+  VISUAL_BUYER_PRIVATE:
+    path: demo_documents/14_visual_buyer_private_card.pdf
+    owner: A
+    classification: A_PRIVATE
+    marker: BUYER_ACQUISITION_STRATEGY
+  VISUAL_STARTUP_PRIVATE:
+    path: demo_documents/15_visual_startup_private_card.pdf
+    owner: B
+    classification: B_PRIVATE
+    marker: STARTUP_NEGOTIATION_POSITION

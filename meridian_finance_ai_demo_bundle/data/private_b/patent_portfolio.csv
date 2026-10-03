@@ -1,0 +1,4 @@
+asset_id,title,type,status,filing_date,named_inventors,all_assignments_recorded,freedom_to_operate,risk
+QS-101,Graph-conditioned transaction anomaly detection,US non-provisional,pending,2024-05-14,3,yes,US search completed 2025-11,medium
+QS-102,Adaptive evidence extraction for credit decisions,US non-provisional,pending,2025-02-03,4,no,limited search only,high
+QS-TS-01,Financial feature-store mappings,trade secret,active,n.a.,0,employee coverage incomplete,not applicable,medium-high

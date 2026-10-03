@@ -1,5 +1,5 @@
+__pycache__/
+*.pyc
 .venv/
 .env
-.venv
-data/
-logs/
+data/meridian/audit.jsonl

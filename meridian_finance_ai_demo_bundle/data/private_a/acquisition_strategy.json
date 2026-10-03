@@ -1,0 +1,17 @@
+{
+  "classification": "A_PRIVATE",
+  "integration_intent": "retain separate product brand for 12 months, then migrate sales and compliance functions",
+  "internal_maximum_headline_ev_usd_m": 102.0,
+  "issuer": "HarborStone Financial Group",
+  "opening_structure": {
+    "cash_at_close_usd_m": 72.0,
+    "earnout_usd_m": 18.0
+  },
+  "required_conditions": [
+    "assignment from former contractor linked to patent QS-102",
+    "removal and retraining of restricted pilot data",
+    "replacement of network-exposed AGPL component",
+    "change-of-control consents from three material customers"
+  ],
+  "target_headline_ev_usd_m": 90.0
+}

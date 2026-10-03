@@ -1,0 +1,7 @@
+model,metric,startup_model,customer_baseline,evaluation_n,period,independent_validation,limitation
+Q-Risk Underwriter,AUROC,0.84,0.72,48200,2025 holdout,yes,portfolio mix differs from two target customer segments
+Q-Risk Underwriter,Brier score,0.118,0.154,48200,2025 holdout,yes,lower is better
+Q-Risk Underwriter,Equal opportunity gap,0.061,0.048,37900,2025 holdout,partial,startup model is worse than baseline; internal threshold 0.08
+Q-Fraud Graph,Precision at 80% recall,0.58,0.41,2600000,2025 transactions,yes,three customers only
+Q-Fraud Graph,False positive rate,0.048,0.071,2600000,2025 transactions,yes,customer thresholds differ
+Q-Doc,Field extraction F1,0.94,0.86,12500,2026 validation,no,internal labeled set

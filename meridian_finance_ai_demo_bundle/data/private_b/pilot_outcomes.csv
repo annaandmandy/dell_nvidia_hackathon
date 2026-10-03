@@ -1,0 +1,4 @@
+pilot_token,product,annualized_customer_benefit_usd_m,annual_fee_usd_m,roi_pct,manual_review_reduction_pct,signed_customer_confirmation,evidence_quality
+PILOT-01,Q-Risk Underwriter,1.9,0.42,3.52,0.41,yes,high
+PILOT-02,Q-Fraud Graph,0.8,0.24,2.33,0.29,yes,medium; six-month extrapolation
+PILOT-03,Q-Doc,1.3,0.36,2.61,0.63,no,medium-low; startup methodology

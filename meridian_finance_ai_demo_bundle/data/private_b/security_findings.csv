@@ -1,0 +1,4 @@
+finding_id,domain,severity,status,estimated_cost_usd_m,required_before_integration
+QS-SEC-01,Secrets management,high,open,0.25,yes
+QS-SEC-02,Model monitoring access,medium,remediation in progress,0.18,yes
+QS-SEC-03,Vendor access review,medium,open,0.12,no

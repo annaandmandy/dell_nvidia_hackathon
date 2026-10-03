@@ -1,0 +1,57 @@
+version: 2
+default_decision: deny
+
+classifications:
+  PUBLIC:
+    allowed_channels: [A_DM, B_DM, JOINT_SLACK, JOINT_MEETING, CAMERA]
+  A_PRIVATE:
+    allowed_channels: [A_DM]
+    owner: A
+  B_PRIVATE:
+    allowed_channels: [B_DM]
+    owner: B
+  JOINT_APPROVED:
+    allowed_channels: [A_DM, B_DM, JOINT_SLACK, JOINT_MEETING, CAMERA]
+    requires_valid_approval: true
+  CLEAN_ROOM:
+    allowed_channels: []
+    processor_only: true
+  AGENT_INTERNAL:
+    allowed_channels: []
+
+release_controls:
+  minimum_group_size: 3
+  deny_party_attributed_private_metrics: true
+  deny_raw_identifiers: true
+  deny_exact_difference_attacks: true
+  query_family_memory: true
+  privacy_budget_per_session: 5
+  preserve_classification_through_transformation: true
+  require_signature_for_joint_financials: true
+  verify_before_calculation: true
+  output_scan_required: true
+  no_existential_confirmation_on_deny: true
+
+deny_reason_codes:
+  - DENY_UNKNOWN_IDENTITY
+  - DENY_CROSS_PARTY_PRIVATE
+  - DENY_CLASSIFICATION
+  - DENY_DIFFERENCE_ATTACK
+  - DENY_SMALL_GROUP
+  - DENY_INDIRECT_INJECTION
+  - DENY_INVALID_SIGNATURE
+  - DENY_PRIVACY_BUDGET
+  - DENY_UNAPPROVED_TOOL_ARGUMENT
+  - DENY_FORGERY_REQUEST
+
+clean_room_jobs:
+  valuation_v2:
+    output_fields: [arr_range, forward_revenue_range, dcf_ev, weighted_range]
+  commercial_quality_v2:
+    output_fields: [arr_growth, retention, margin, concentration_pct, weighted_pipeline, runway]
+  synergy_npv_v2:
+    output_fields: [steady_state_ebitda_synergy, five_year_net_npv, assumptions]
+  buyer_reliability_v2:
+    output_fields: [funding_coverage, pro_forma_leverage, covenant_headroom, risk_flags]
+  ip_legal_summary_v2:
+    output_fields: [issue_category, severity, required_action, release_condition]

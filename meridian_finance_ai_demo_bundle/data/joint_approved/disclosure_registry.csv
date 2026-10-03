@@ -1,0 +1,11 @@
+resource_id,owner,classification,joint_display,purpose
+BUYER_PUBLIC_PROFILE,A,PUBLIC,allow,buyer overview
+STARTUP_PUBLIC_PROFILE,B,PUBLIC,allow,startup overview
+STARTUP_COMMERCIAL_SUMMARY,B,JOINT_APPROVED,allow,valuation and profitability analysis
+VALUATION_ANALYSIS,NEUTRAL,JOINT_APPROVED,allow,deal evaluation
+IP_LEGAL_SUMMARY,B,JOINT_APPROVED,allow,risk allocation
+BUYER_RELIABILITY_SUMMARY,A,JOINT_APPROVED,allow,seller counterparty diligence
+BUYER_ACQUISITION_STRATEGY,A,A_PRIVATE,deny,buyer negotiation
+STARTUP_NEGOTIATION_POSITION,B,B_PRIVATE,deny,seller negotiation
+RAW_CUSTOMER_ARR,B,CLEAN_ROOM,deny,concentration and retention analysis
+RAW_PATENT_AND_TRAINING_DATA,B,CLEAN_ROOM,deny,IP and data-rights analysis
