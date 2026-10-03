@@ -18,7 +18,7 @@ from dotenv import load_dotenv
 from slack_bolt import App
 from slack_bolt.adapter.socket_mode import SocketModeHandler
 
-from app import Context, handle_request
+from app import Context, handle_request, load_visual_criteria, parse_visual_criteria_text, format_criteria_table
 
 load_dotenv()
 
@@ -134,6 +134,43 @@ def format_response(result: dict[str, Any]) -> str:
     return "\n".join(lines).strip()
 
 
+def is_visual_criteria_command(text: str) -> bool:
+    t = text.lower()
+    return (
+        "visual" in t
+        or "criteria" in t
+        or "condition" in t
+        or "审查" in text
+        or "条件" in text
+        or "检查" in text
+    ) and (
+        "set" in t
+        or "update" in t
+        or "change" in t
+        or "修改" in text
+        or "设置" in text
+        or "设定" in text
+    )
+
+
+def is_show_visual_criteria_command(text: str) -> bool:
+    t = text.lower()
+    return (
+        ("show" in t or "list" in t or "当前" in text or "查看" in text)
+        and ("criteria" in t or "condition" in t or "条件" in text or "审查" in text)
+    )
+
+
+def format_criteria_response(criteria) -> str:
+    return (
+        "*Meridian visual audit criteria updated.*\n"
+        "The Chrome monitoring UI will refresh automatically.\n\n"
+        f"{format_criteria_table(criteria)}\n\n"
+        "Example update command:\n"
+        "`@mergeops set visual criteria: people=2; metal cup=1; AI host=1`"
+    )
+
+
 def build_slack_app() -> App:
     require_tokens()
     slack_app = App(token=BOT_TOKEN)
@@ -141,6 +178,13 @@ def build_slack_app() -> App:
     @slack_app.event("app_mention")
     def on_app_mention(event, say):
         text = strip_bot_mention(event.get("text", ""))
+        if is_visual_criteria_command(text):
+            criteria = parse_visual_criteria_text(text)
+            say(format_criteria_response(criteria))
+            return
+        if is_show_visual_criteria_command(text):
+            say("*Current Meridian visual audit criteria:*\n" + format_criteria_table(load_visual_criteria()))
+            return
         ctx = infer_context(event)
         result = handle_request(text, ctx)
         say(format_response(result))
@@ -153,6 +197,13 @@ def build_slack_app() -> App:
             return
         text = strip_bot_mention(event.get("text", ""))
         if not text:
+            return
+        if is_visual_criteria_command(text):
+            criteria = parse_visual_criteria_text(text)
+            say(format_criteria_response(criteria))
+            return
+        if is_show_visual_criteria_command(text):
+            say("*Current Meridian visual audit criteria:*\n" + format_criteria_table(load_visual_criteria()))
             return
         ctx = infer_context(event)
         result = handle_request(text, ctx)

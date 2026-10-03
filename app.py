@@ -38,6 +38,7 @@ ROOT = Path(__file__).parent
 DATA_DIR = ROOT / "data" / "meridian"
 AUDIT_PATH = DATA_DIR / "audit.jsonl"
 RESOURCE_PATH = DATA_DIR / "resources.json"
+VISUAL_CRITERIA_PATH = DATA_DIR / "visual_criteria.json"
 
 LLM_URL = (
     os.environ.get("MERIDIAN_LLM_URL")
@@ -51,6 +52,8 @@ NGC_API_KEY = os.environ.get("NGC_API_KEY", "local")
 VISION_MODEL = os.environ.get("MERIDIAN_VISION_MODEL") or os.environ.get("OPENAI_VISION_MODEL") or "gpt-4o-mini"
 TTS_MODEL = os.environ.get("MERIDIAN_TTS_MODEL") or os.environ.get("OPENAI_TTS_MODEL") or "gpt-4o-mini-tts"
 TTS_VOICE = os.environ.get("MERIDIAN_TTS_VOICE") or os.environ.get("OPENAI_TTS_VOICE") or "alloy"
+ASR_MODEL = os.environ.get("MERIDIAN_ASR_MODEL") or os.environ.get("OPENAI_ASR_MODEL") or "whisper-1"
+ASR_URL = os.environ.get("NIM_ASR_URL") or "https://api.openai.com/v1/audio/transcriptions"
 SLACK_BOT_TOKEN = os.environ.get("SLACK_BOT_TOKEN", "")
 SLACK_WEBHOOK_URL = os.environ.get("SLACK_WEBHOOK_URL", "")
 SLACK_CHANNEL_ID = (os.environ.get("MERIDIAN_JOINT_CHANNEL_IDS", "").split(",")[0] or "").strip()
@@ -58,6 +61,14 @@ VISUAL_MONITOR_STATE: dict[str, Any] = {
     "last_signature": None,
     "last_slack_at": None,
     "frame_count": 0,
+    "finalized": None,
+}
+VOICE_MONITOR_STATE: dict[str, Any] = {
+    "active": False,
+    "chunk_count": 0,
+    "pending_resource_id": None,
+    "pending_request_text": None,
+    "last_action": None,
 }
 
 app = Flask(__name__) if Flask else None
@@ -210,22 +221,180 @@ def response_text(payload: dict[str, Any]) -> str:
     return "\n".join(chunks).strip()
 
 
-def inspect_visual_frame(image_data_url: str, questions: str = "") -> dict[str, Any]:
+DEFAULT_VISUAL_CRITERIA = [
+    {
+        "id": "people",
+        "object": "people in meeting",
+        "target_count": 2,
+        "description": "At least two people are visible in the meeting.",
+        "current_count": 0,
+        "completed": False,
+        "evidence": "",
+    },
+    {
+        "id": "metal_cup",
+        "object": "metal cup or bottle",
+        "target_count": 1,
+        "description": "At least one metallic cup or bottle is visible.",
+        "current_count": 0,
+        "completed": False,
+        "evidence": "",
+    },
+    {
+        "id": "ai_host",
+        "object": "AI host/workstation/server",
+        "target_count": 1,
+        "description": "At least one desktop host, workstation, GPU box, or server is visible.",
+        "current_count": 0,
+        "completed": False,
+        "evidence": "",
+    },
+]
+
+
+def slugify(value: str) -> str:
+    slug = re.sub(r"[^a-z0-9]+", "_", value.lower()).strip("_")
+    return slug or f"criterion_{uuid.uuid4().hex[:6]}"
+
+
+def parse_count(value: str) -> int | None:
+    if value.isdigit():
+        return int(value)
+    return {
+        "一": 1,
+        "一个": 1,
+        "一台": 1,
+        "一条": 1,
+        "两": 2,
+        "两个": 2,
+        "两位": 2,
+        "二": 2,
+        "三": 3,
+        "四": 4,
+        "五": 5,
+    }.get(value)
+
+
+def load_visual_criteria() -> list[dict[str, Any]]:
+    if VISUAL_CRITERIA_PATH.exists():
+        try:
+            data = json.loads(VISUAL_CRITERIA_PATH.read_text())
+            if isinstance(data, list) and data:
+                return data
+        except Exception:
+            pass
+    save_visual_criteria(DEFAULT_VISUAL_CRITERIA, reset_progress=True)
+    return json.loads(json.dumps(DEFAULT_VISUAL_CRITERIA))
+
+
+def save_visual_criteria(criteria: list[dict[str, Any]], reset_progress: bool = False) -> list[dict[str, Any]]:
+    DATA_DIR.mkdir(parents=True, exist_ok=True)
+    normalized = []
+    for item in criteria:
+        obj = str(item.get("object") or item.get("label") or "").strip()
+        if not obj:
+            continue
+        target = int(item.get("target_count") or item.get("target") or 1)
+        normalized.append({
+            "id": item.get("id") or slugify(obj),
+            "object": obj,
+            "target_count": max(target, 1),
+            "description": item.get("description") or f"At least {max(target, 1)} {obj} visible.",
+            "current_count": 0 if reset_progress else int(item.get("current_count") or 0),
+            "completed": False if reset_progress else bool(item.get("completed")),
+            "evidence": "" if reset_progress else item.get("evidence", ""),
+        })
+    if not normalized:
+        normalized = json.loads(json.dumps(DEFAULT_VISUAL_CRITERIA))
+    VISUAL_CRITERIA_PATH.write_text(json.dumps(normalized, indent=2))
+    if reset_progress:
+        VISUAL_MONITOR_STATE["finalized"] = None
+        VISUAL_MONITOR_STATE["frame_count"] = 0
+    return normalized
+
+
+def parse_visual_criteria_text(text: str) -> list[dict[str, Any]]:
+    body = strip_command_prefix(text)
+    parsed = []
+
+    try:
+        data = json.loads(body)
+        if isinstance(data, list):
+            return save_visual_criteria(data, reset_progress=True)
+    except Exception:
+        pass
+
+    parts = [p.strip(" .。") for p in re.split(r"[;；\n，、]+", body) if p.strip(" .。")]
+    for part in parts:
+        match = re.search(r"(.+?)(?:>=|=|:|至少|不少于|目标|target)?\s*(\d+)\s*$", part, re.I)
+        if match:
+            obj = match.group(1).strip(" -:：")
+            target = int(match.group(2))
+        else:
+            obj = part.strip(" -:：")
+            prefix = re.match(r"^(一台|一个|一条|两个|两位|一|两|二|三|四|五)", obj)
+            target = parse_count(prefix.group(1)) if prefix else 1
+        lower = obj.lower()
+        if any(k in lower for k in ["people", "person", "人"]):
+            obj = "people in meeting"
+        elif any(k in lower for k in ["metal", "cup", "bottle", "铁", "金属", "水杯"]):
+            obj = "metal cup or bottle"
+        elif any(k in lower for k in ["host", "server", "workstation", "gpu", "主机", "服务器"]):
+            obj = "AI host/workstation/server"
+        parsed.append({
+            "id": slugify(obj),
+            "object": obj,
+            "target_count": target,
+            "description": f"At least {target} {obj} visible.",
+        })
+    return save_visual_criteria(parsed, reset_progress=True)
+
+
+def strip_command_prefix(text: str) -> str:
+    cleaned = re.sub(r"<@[A-Z0-9]+>\s*", "", text or "").strip()
+    cleaned = re.sub(
+        r"^(set|update|change|修改|设置|设定)\s*(visual\s*)?(audit\s*)?(criteria|conditions|条件|审查条件)?[:：]?",
+        "",
+        cleaned,
+        flags=re.I,
+    ).strip()
+    return cleaned
+
+
+def criteria_prompt(criteria: list[dict[str, Any]]) -> str:
+    rows = [
+        {
+            "id": c["id"],
+            "object": c["object"],
+            "target_count": c["target_count"],
+            "description": c.get("description", ""),
+        }
+        for c in criteria
+    ]
+    return json.dumps(rows, ensure_ascii=False, indent=2)
+
+
+def inspect_visual_frame(image_data_url: str, questions: str = "", criteria: list[dict[str, Any]] | None = None) -> dict[str, Any]:
     if not OPENAI_API_KEY:
         return {
             "decision": "UNAVAILABLE",
             "reason_code": "VISION_API_NOT_CONFIGURED",
             "answer": "Vision inspection needs OPENAI_API_KEY for laptop testing or a local vision endpoint on GB10.",
         }
+    active_criteria = criteria or load_visual_criteria()
     prompt = f"""
 You are Meridian's visual field inspection module for an M&A meeting.
 Analyze one webcam still image. Return ONLY valid JSON.
 
-Inspection goals:
-1. Estimate whether two people are present in the meeting.
-2. Determine whether a visible cup/bottle appears metallic, especially steel/aluminum.
-3. Determine whether an AI company has a visible physical host: desktop tower, workstation, server, GPU box, or similar compute asset.
-4. List concise visual evidence and uncertainties. Do not identify people.
+Active audit criteria:
+{criteria_prompt(active_criteria)}
+
+For each criterion, estimate the current visible count. If a criterion is about
+people, count visible people without identifying them. If a criterion is about
+material, such as metal, report uncertainty when the material cannot be reliably
+confirmed from the image. If a criterion is about a host/workstation/server,
+count visible desktop towers, GPU boxes, servers, or workstation-like compute assets.
+Do not identify people.
 
 Extra user questions:
 {questions or "None"}
@@ -235,12 +404,15 @@ JSON schema:
   "decision": "ALLOW",
   "reason_code": "VISUAL_FIELD_INSPECTION",
   "summary": "one sentence",
-  "asset_checks": {{
-    "people_count_estimate": 0,
-    "exactly_two_people_present": "yes|no|uncertain",
-    "metal_cup_or_bottle_present": "yes|no|uncertain",
-    "ai_host_or_workstation_present": "yes|no|uncertain"
-  }},
+  "criteria_results": [
+    {{
+      "id": "criterion id from Active audit criteria",
+      "current_count": 0,
+      "satisfied": true,
+      "evidence": "short visible evidence",
+      "confidence": "high|medium|low"
+    }}
+  ],
   "observations": ["short evidence strings"],
   "uncertainties": ["short uncertainty strings"],
   "meeting_readiness": "pass|warn|fail"
@@ -352,6 +524,78 @@ def should_post_visual_update(result: dict[str, Any], heartbeat_seconds: int, fo
     return True, reason
 
 
+def apply_visual_results_to_criteria(result: dict[str, Any]) -> list[dict[str, Any]]:
+    criteria = load_visual_criteria()
+    by_id = {c["id"]: c for c in criteria}
+    criteria_results = result.get("criteria_results") or []
+    for observed in criteria_results:
+        cid = observed.get("id")
+        if cid not in by_id:
+            continue
+        criterion = by_id[cid]
+        current = int(observed.get("current_count") or 0)
+        criterion["current_count"] = max(int(criterion.get("current_count") or 0), current)
+        if observed.get("evidence"):
+            criterion["evidence"] = observed.get("evidence", "")
+        target = int(criterion.get("target_count") or 1)
+        if current >= target or observed.get("satisfied") is True:
+            criterion["completed"] = True
+
+    save_visual_criteria(criteria, reset_progress=False)
+    return criteria
+
+
+def criteria_complete(criteria: list[dict[str, Any]]) -> bool:
+    return bool(criteria) and all(bool(c.get("completed")) for c in criteria)
+
+
+def unmet_criteria(criteria: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [c for c in criteria if not c.get("completed")]
+
+
+def format_criteria_table(criteria: list[dict[str, Any]]) -> str:
+    lines = []
+    for c in criteria:
+        mark = "x" if c.get("completed") else " "
+        lines.append(
+            f"- [{mark}] {c['object']}: {c.get('current_count', 0)}/{c['target_count']}"
+            + (f" — {c.get('evidence')}" if c.get("evidence") else "")
+        )
+    return "\n".join(lines)
+
+
+def post_visual_allow(criteria: list[dict[str, Any]]) -> dict[str, Any]:
+    if VISUAL_MONITOR_STATE.get("finalized") == "ALLOW":
+        return {"ok": True, "via": "already_finalized", "error": None}
+    text = (
+        "*Meridian Visual Audit — ALLOW*\n"
+        "All configured visual audit conditions are satisfied.\n\n"
+        f"{format_criteria_table(criteria)}"
+    )
+    VISUAL_MONITOR_STATE["finalized"] = "ALLOW"
+    return post_to_slack(text)
+
+
+def post_visual_deny(criteria: list[dict[str, Any]], reason: str) -> dict[str, Any]:
+    if VISUAL_MONITOR_STATE.get("finalized") == "DENY":
+        return {"ok": True, "via": "already_finalized", "error": None}
+    missing = unmet_criteria(criteria)
+    missing_lines = "\n".join(
+        f"- {c['object']}: {c.get('current_count', 0)}/{c['target_count']}"
+        for c in missing
+    ) or "- none"
+    text = (
+        "*Meridian Visual Audit — DENY*\n"
+        f"Reason: {reason}\n\n"
+        "*Unmet conditions:*\n"
+        f"{missing_lines}\n\n"
+        "*Current checklist:*\n"
+        f"{format_criteria_table(criteria)}"
+    )
+    VISUAL_MONITOR_STATE["finalized"] = "DENY"
+    return post_to_slack(text)
+
+
 def post_to_slack(text: str) -> dict[str, Any]:
     if SLACK_BOT_TOKEN and SLACK_CHANNEL_ID:
         resp = requests.post(
@@ -383,6 +627,121 @@ def synthesize_tts(text: str) -> str | None:
     resp.raise_for_status()
     out_path.write_bytes(resp.content)
     return f"/media/tts/{out_path.name}"
+
+
+def transcribe_audio(audio_bytes: bytes, filename: str, mime_type: str) -> str:
+    if not (OPENAI_API_KEY or ASR_URL.startswith("http://localhost") or ASR_URL.startswith("http://127.0.0.1")):
+        raise RuntimeError("ASR needs OPENAI_API_KEY for laptop testing or NIM_ASR_URL for GB10.")
+    headers = {"Authorization": f"Bearer {OPENAI_API_KEY or NGC_API_KEY}"}
+    files = {"file": (filename or "meeting.webm", audio_bytes, mime_type or "audio/webm")}
+    data = {"model": ASR_MODEL}
+    resp = requests.post(ASR_URL, headers=headers, files=files, data=data, timeout=60)
+    resp.raise_for_status()
+    payload = resp.json()
+    return (payload.get("text") or payload.get("transcript") or "").strip()
+
+
+def detect_document_request(transcript: str) -> str | None:
+    t = transcript.lower()
+    request_words = ("can i have", "can we have", "could i have", "could we have", "please send", "pull", "show", "share")
+    financial_words = ("financial statement", "financial statements", "financial summary", "finance statement", "2025 revenue", "ebitda")
+    if any(w in t for w in request_words) and any(w in t for w in financial_words):
+        return "JOINT_FINANCIAL_SUMMARY"
+    return None
+
+
+def detect_consent(transcript: str) -> bool:
+    t = re.sub(r"[^a-z0-9\s']", " ", transcript.lower())
+    consent_phrases = (
+        "yes",
+        "yes please",
+        "yes you can",
+        "sure",
+        "go ahead",
+        "approved",
+        "that's okay",
+        "that is okay",
+        "i approve",
+        "we approve",
+        "you can share",
+        "please share",
+    )
+    return any(re.search(rf"\b{re.escape(phrase)}\b", t) for phrase in consent_phrases)
+
+
+def financial_statement_slack(resource_id: str, approved_by_voice: bool = True) -> str:
+    resources = load_resources()
+    resource = resources.get(resource_id, resources["JOINT_FINANCIAL_SUMMARY"])
+    calc = financials()
+    facts = calc["verified_facts"]
+    results = calc["calculated_results"]
+    return "\n".join([
+        f"*Meridian pulled `{resource_id}`* — voice consent detected" if approved_by_voice else f"*Meridian pulled `{resource_id}`*",
+        f"{resource['title']} ({resource['classification']})",
+        "",
+        "*Verified 2025 facts*",
+        f"• Company A revenue `${facts['company_a']['revenue_m']:.1f}m`, EBITDA `${facts['company_a']['ebitda_m']:.1f}m`",
+        f"• Company B revenue `${facts['company_b']['revenue_m']:.1f}m`, EBITDA `${facts['company_b']['ebitda_m']:.1f}m`",
+        "",
+        "*Calculated combined results*",
+        f"• Revenue `${results['combined_revenue_m']:.1f}m`",
+        f"• EBITDA `${results['combined_ebitda_m']:.1f}m`",
+        f"• EBITDA margin `{results['combined_ebitda_margin_pct']:.1f}%`",
+        "",
+        f"Receipt input hash: `{calc['receipt']['input_hash']}`",
+    ])
+
+
+def process_voice_transcript(transcript: str) -> dict[str, Any]:
+    VOICE_MONITOR_STATE["chunk_count"] = int(VOICE_MONITOR_STATE.get("chunk_count") or 0) + 1
+    clean = transcript.strip()
+    if not clean:
+        return {"action": "silence", "posted_to_slack": False}
+
+    requested_resource = detect_document_request(clean)
+    consent = detect_consent(clean)
+    action = "transcribed"
+    slack = {"ok": True, "via": "suppressed", "error": None}
+
+    if requested_resource:
+        VOICE_MONITOR_STATE["pending_resource_id"] = requested_resource
+        VOICE_MONITOR_STATE["pending_request_text"] = clean
+        if consent:
+            action = "request_and_consent_detected_pull_document"
+            slack = post_to_slack(financial_statement_slack(requested_resource, approved_by_voice=True))
+            VOICE_MONITOR_STATE["pending_resource_id"] = None
+            VOICE_MONITOR_STATE["pending_request_text"] = None
+        else:
+            action = "request_detected"
+            slack = post_to_slack(
+                "*Meridian Voice Monitor* — document request detected\n"
+                f"Request: “{clean}”\n"
+                f"Pending resource: `{requested_resource}`\n"
+                "Waiting for explicit voice approval before posting the file summary."
+            )
+
+    elif consent and VOICE_MONITOR_STATE.get("pending_resource_id"):
+        resource_id = str(VOICE_MONITOR_STATE["pending_resource_id"])
+        action = "consent_detected_pull_document"
+        slack = post_to_slack(financial_statement_slack(resource_id, approved_by_voice=True))
+        VOICE_MONITOR_STATE["pending_resource_id"] = None
+        VOICE_MONITOR_STATE["pending_request_text"] = None
+
+    VOICE_MONITOR_STATE["last_action"] = action
+    audit({
+        "decision": "ALLOW",
+        "reason_code": "VOICE_MEETING_MONITOR",
+        "tool": "voice_monitor",
+        "action": action,
+        "transcript": clean[:300],
+        "slack_ok": slack.get("ok"),
+    })
+    return {
+        "action": action,
+        "posted_to_slack": slack.get("via") != "suppressed",
+        "slack": slack,
+        "pending_resource_id": VOICE_MONITOR_STATE.get("pending_resource_id"),
+    }
 
 
 def denied(reason_code: str, ctx: Context, text: str) -> dict[str, Any]:
@@ -519,6 +878,10 @@ if app:
     def vision_page() -> str:
         return VISION_HTML
 
+    @app.route("/voice")
+    def voice_page() -> str:
+        return VOICE_HTML
+
 
     @app.route("/api/ask", methods=["POST"])
     def ask():
@@ -544,23 +907,21 @@ if app:
             return jsonify({"error": "image_data_url must be a base64 data URL"}), 400
         questions = body.get("questions", "")
         try:
-            result = inspect_visual_frame(image_data_url, questions)
-            slack_text = format_visual_slack(result)
+            criteria = load_visual_criteria()
+            result = inspect_visual_frame(image_data_url, questions, criteria)
             monitoring = bool(body.get("monitoring"))
-            heartbeat_seconds = int(body.get("heartbeat_seconds") or 60)
-            post_update, post_reason = should_post_visual_update(
-                result,
-                heartbeat_seconds=heartbeat_seconds,
-                force=not monitoring,
-            )
-            slack = post_to_slack(slack_text) if post_update else {
+            VISUAL_MONITOR_STATE["frame_count"] = int(VISUAL_MONITOR_STATE.get("frame_count") or 0) + 1
+            updated_criteria = apply_visual_results_to_criteria(result)
+            is_complete = criteria_complete(updated_criteria)
+            post_reason = "allow_all_conditions_met" if is_complete else "suppressed_until_final"
+            slack = post_visual_allow(updated_criteria) if is_complete else {
                 "ok": True,
                 "via": "suppressed",
                 "error": None,
             }
             tts_url = None
-            if body.get("tts") and post_update:
-                tts_url = synthesize_tts(result.get("summary", slack_text[:800]))
+            if body.get("tts") and is_complete:
+                tts_url = synthesize_tts("Meridian visual audit allowed. All configured conditions are satisfied.")
             audit({
                 "decision": result.get("decision"),
                 "reason_code": result.get("reason_code"),
@@ -575,15 +936,90 @@ if app:
                 "monitor": {
                     "active": monitoring,
                     "frame_count": VISUAL_MONITOR_STATE.get("frame_count"),
-                    "posted_to_slack": post_update,
+                    "posted_to_slack": is_complete,
                     "post_reason": post_reason,
+                    "complete": is_complete,
                 },
+                "criteria": updated_criteria,
                 "slack": slack,
                 "tts_url": tts_url,
             })
         except Exception as exc:
             audit({"decision": "ERROR", "reason_code": "VISUAL_INSPECTION_ERROR", "error": str(exc)})
             return jsonify({"decision": "ERROR", "reason_code": "VISUAL_INSPECTION_ERROR", "error": str(exc)}), 500
+
+    @app.route("/api/visual-criteria", methods=["GET", "POST"])
+    def visual_criteria():
+        if request.method == "GET":
+            criteria = load_visual_criteria()
+            return jsonify({
+                "criteria": criteria,
+                "complete": criteria_complete(criteria),
+                "finalized": VISUAL_MONITOR_STATE.get("finalized"),
+            })
+        body = request.json or {}
+        if body.get("criteria"):
+            criteria = save_visual_criteria(body["criteria"], reset_progress=True)
+        else:
+            criteria = parse_visual_criteria_text(body.get("text", ""))
+        return jsonify({"criteria": criteria, "complete": criteria_complete(criteria), "finalized": None})
+
+    @app.route("/api/visual-monitor/stop", methods=["POST"])
+    def stop_visual_monitor():
+        body = request.json or {}
+        criteria = load_visual_criteria()
+        reason = body.get("reason") or "Manual stop before all configured conditions were satisfied."
+        if criteria_complete(criteria):
+            slack = post_visual_allow(criteria)
+            decision = "ALLOW"
+        else:
+            slack = post_visual_deny(criteria, reason)
+            decision = "DENY"
+        audit({"decision": decision, "reason_code": "VISUAL_MONITOR_STOP", "slack_ok": slack.get("ok")})
+        return jsonify({
+            "decision": decision,
+            "reason": reason,
+            "criteria": criteria,
+            "complete": criteria_complete(criteria),
+            "slack": slack,
+        })
+
+    @app.route("/api/voice-chunk", methods=["POST"])
+    def voice_chunk():
+        audio = request.files.get("audio")
+        if not audio:
+            return jsonify({"error": "audio file is required"}), 400
+        try:
+            transcript = transcribe_audio(
+                audio.read(),
+                filename=audio.filename or "meeting.webm",
+                mime_type=audio.mimetype or "audio/webm",
+            )
+            result = process_voice_transcript(transcript)
+            return jsonify({
+                "transcript": transcript,
+                "voice": {
+                    "active": True,
+                    "chunk_count": VOICE_MONITOR_STATE.get("chunk_count"),
+                    "pending_resource_id": VOICE_MONITOR_STATE.get("pending_resource_id"),
+                    "last_action": VOICE_MONITOR_STATE.get("last_action"),
+                },
+                **result,
+            })
+        except Exception as exc:
+            audit({"decision": "ERROR", "reason_code": "VOICE_MONITOR_ERROR", "error": str(exc)})
+            return jsonify({"decision": "ERROR", "reason_code": "VOICE_MONITOR_ERROR", "error": str(exc)}), 500
+
+    @app.route("/api/voice-reset", methods=["POST"])
+    def voice_reset():
+        VOICE_MONITOR_STATE.update({
+            "active": False,
+            "chunk_count": 0,
+            "pending_resource_id": None,
+            "pending_request_text": None,
+            "last_action": "reset",
+        })
+        return jsonify({"ok": True, "voice": VOICE_MONITOR_STATE})
 
     @app.route("/media/tts/<name>")
     def tts_media(name: str):
@@ -601,6 +1037,8 @@ if app:
             "llm_model": LLM_MODEL,
             "llm_api_configured": bool(OPENAI_API_KEY),
             "vision_model": VISION_MODEL,
+            "asr_url": ASR_URL,
+            "asr_model": ASR_MODEL,
             "tts_model": TTS_MODEL,
             "slack_channel_configured": bool(SLACK_CHANNEL_ID or SLACK_WEBHOOK_URL),
         })
@@ -661,52 +1099,65 @@ VISION_HTML = """<!doctype html>
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Meridian Visual Inspection</title>
+<title>Meridian Visual Audit</title>
 <style>
 body{margin:0;background:#0f1319;color:#e7edf5;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
-main{max-width:1120px;margin:0 auto;padding:24px}
+main{max-width:1220px;margin:0 auto;padding:24px}
 h1{font-size:22px;margin:0}.sub{color:#9aa8ba;margin:6px 0 18px}
-.grid{display:grid;grid-template-columns:minmax(320px,560px) 1fr;gap:18px}
+.grid{display:grid;grid-template-columns:minmax(320px,520px) 1fr;gap:18px}
 .panel{background:#171c24;border:1px solid #2b3545;border-radius:8px;padding:14px}
 video,canvas{width:100%;background:#06080c;border-radius:6px;aspect-ratio:4/3;object-fit:cover}
 canvas{display:none}button,textarea,label{width:100%;box-sizing:border-box}
 label{display:block;margin:12px 0 4px;color:#9aa8ba;font-size:12px}
-textarea{min-height:86px;border:1px solid #334155;border-radius:6px;background:#0b1017;color:#e7edf5;padding:10px}
+textarea{min-height:74px;border:1px solid #334155;border-radius:6px;background:#0b1017;color:#e7edf5;padding:10px}
 button{border:1px solid #2f6feb;background:#2f6feb;color:white;padding:10px;border-radius:6px;font-weight:700;margin-top:10px;cursor:pointer}
 button.secondary{background:#222b38;border-color:#3b4658}
 button.danger{background:#7f1d1d;border-color:#991b1b}
 input{border:1px solid #334155;border-radius:6px;background:#0b1017;color:#e7edf5;padding:8px}
 .row{display:grid;grid-template-columns:1fr 1fr;gap:10px}
 .status{font-size:13px;color:#9cc7ff;margin-top:10px;min-height:18px}
-pre{white-space:pre-wrap;word-break:break-word;min-height:420px;background:#0b1017;border:1px solid #29313f;border-radius:8px;padding:12px}
+table{width:100%;border-collapse:collapse;margin-top:8px}
+th,td{border-bottom:1px solid #2b3545;padding:10px;text-align:left;vertical-align:middle}
+th{color:#9aa8ba;font-size:12px;font-weight:600}
+td.count,td.target{text-align:right;font-variant-numeric:tabular-nums}
+input[type=checkbox]{width:20px;height:20px;accent-color:#22c55e}
+.done{color:#86efac}.missing{color:#fca5a5}.hint{font-size:12px;color:#8a98aa;margin-top:8px}
+pre{white-space:pre-wrap;word-break:break-word;min-height:160px;background:#0b1017;border:1px solid #29313f;border-radius:8px;padding:12px}
 audio{width:100%;margin-top:10px}
-.hint{font-size:12px;color:#8a98aa;margin-top:8px}
 </style>
 </head>
 <body><main>
-<h1>Meridian Visual Inspection</h1>
-<div class="sub">Chrome webcam still capture. Results are posted to Slack as the meeting channel output.</div>
+<h1>Meridian Visual Audit</h1>
+<div class="sub">Continuous webcam monitoring. Slack receives only final ALLOW or manual-stop DENY.</div>
 <div class="grid">
 <section class="panel">
 <video id="video" autoplay playsinline muted></video>
 <canvas id="canvas"></canvas>
-<label>Inspection questions</label>
-<textarea id="questions">Check whether two people are present, whether a cup or bottle appears metallic, and whether a desktop host, workstation, GPU box, or server is visible.</textarea>
-<button onclick="capture()">Capture still and inspect</button>
+<label>Extra inspection notes</label>
+<textarea id="questions">Use the configured checklist. Do not identify people.</textarea>
+<button onclick="capture()">Run one inspection frame</button>
 <button onclick="startMonitor()">Start continuous monitoring</button>
-<button class="danger" onclick="stopMonitor()">Stop monitoring</button>
+<button class="danger" onclick="stopMonitor()">Stop monitoring and send DENY if incomplete</button>
 <button class="secondary" onclick="startCamera()">Restart camera</button>
 <div class="row">
   <div><label>Frame interval seconds</label><input id="interval" type="number" min="4" value="8"></div>
-  <div><label>Slack heartbeat seconds</label><input id="heartbeat" type="number" min="20" value="60"></div>
+  <div><label>TTS</label><label><input id="tts" type="checkbox" checked style="width:auto"> Generate final voice</label></div>
 </div>
-<label><input id="tts" type="checkbox" checked style="width:auto"> Generate TTS summary</label>
 <div id="status" class="status">Monitor stopped.</div>
-<div class="hint">Continuous mode samples still frames at the chosen interval. Slack posts only on changes, alerts, or heartbeat.</div>
+<div class="hint">Checklist is sticky: once a condition is satisfied, it stays checked for this audit run.</div>
 <audio id="audio" controls style="display:none"></audio>
 </section>
 <section class="panel">
-<pre id="out">Ready. Allow camera access, frame the meeting room/assets, then capture.</pre>
+<div class="row">
+  <div><strong>Audit checklist</strong></div>
+  <div id="overall" style="text-align:right;color:#9aa8ba">Loading...</div>
+</div>
+<table>
+<thead><tr><th>Object</th><th>Count</th><th>Target</th><th>Done</th></tr></thead>
+<tbody id="criteriaBody"></tbody>
+</table>
+<label>Latest model output</label>
+<pre id="out">Ready. Mention @mergeops in Slack to change criteria, or monitor with defaults.</pre>
 </section>
 </div>
 </main>
@@ -716,13 +1167,31 @@ const canvas=document.getElementById('canvas');
 const out=document.getElementById('out');
 const audio=document.getElementById('audio');
 const statusEl=document.getElementById('status');
+const criteriaBody=document.getElementById('criteriaBody');
+const overall=document.getElementById('overall');
 let monitor=false;
 let inFlight=false;
 let timer=null;
 let frameNo=0;
+
 async function startCamera(){
   const stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:1280},height:{ideal:720}},audio:false});
   video.srcObject=stream;
+}
+function renderCriteria(criteria, complete, finalized){
+  criteriaBody.innerHTML=(criteria||[]).map(c=>`<tr>
+    <td>${c.object}<div class="${c.completed?'done':'missing'}">${c.evidence||''}</div></td>
+    <td class="count">${c.current_count||0}</td>
+    <td class="target">${c.target_count}</td>
+    <td><input type="checkbox" disabled ${c.completed?'checked':''}></td>
+  </tr>`).join('');
+  overall.textContent=finalized?`Finalized: ${finalized}`:(complete?'All conditions met':'In progress');
+  overall.className=complete?'done':'missing';
+}
+async function loadCriteria(){
+  const res=await fetch('/api/visual-criteria');
+  const data=await res.json();
+  renderCriteria(data.criteria, data.complete, data.finalized);
 }
 async function captureFrame({monitoring=false}={}){
   if(inFlight) return;
@@ -742,15 +1211,16 @@ async function captureFrame({monitoring=false}={}){
         image_data_url,
         questions:document.getElementById('questions').value,
         tts:document.getElementById('tts').checked,
-        monitoring,
-        heartbeat_seconds:Number(document.getElementById('heartbeat').value||60)
+        monitoring
       })
     });
     const data=await res.json();
     out.textContent=JSON.stringify(data,null,2);
+    renderCriteria(data.criteria, data.monitor && data.monitor.complete, data.monitor && data.monitor.complete ? 'ALLOW' : null);
     const posted=data.monitor && data.monitor.posted_to_slack;
     const reason=data.monitor && data.monitor.post_reason;
-    statusEl.textContent=(monitoring?'Monitoring':'Single check')+' frame '+frameNo+' complete. Slack: '+(posted?'posted':'suppressed')+' ('+reason+').';
+    statusEl.textContent=(monitoring?'Monitoring':'Single check')+' frame '+frameNo+' complete. Slack: '+(posted?'final posted':'not yet')+' ('+reason+').';
+    if(data.monitor && data.monitor.complete){monitor=false;clearTimeout(timer);}
     if(data.tts_url){audio.src=data.tts_url;audio.style.display='block';audio.play().catch(()=>{});}
   }catch(err){
     statusEl.textContent='Inspection error: '+err;
@@ -758,9 +1228,7 @@ async function captureFrame({monitoring=false}={}){
     inFlight=false;
   }
 }
-async function capture(){
-  await captureFrame({monitoring:false});
-}
+async function capture(){ await captureFrame({monitoring:false}); }
 function startMonitor(){
   monitor=true;
   statusEl.textContent='Monitor starting...';
@@ -773,12 +1241,133 @@ function scheduleNext(){
   const seconds=Math.max(4, Number(document.getElementById('interval').value||8));
   timer=setTimeout(async()=>{ if(monitor){ await captureFrame({monitoring:true}); scheduleNext(); } }, seconds*1000);
 }
-function stopMonitor(){
+async function stopMonitor(){
   monitor=false;
   clearTimeout(timer);
-  statusEl.textContent='Monitor stopped.';
+  const res=await fetch('/api/visual-monitor/stop',{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify({reason:'Manual stop before all visual audit conditions were satisfied.'})});
+  const data=await res.json();
+  renderCriteria(data.criteria, data.complete, data.decision);
+  out.textContent=JSON.stringify(data,null,2);
+  statusEl.textContent='Monitor stopped. Final decision: '+data.decision+'.';
 }
 startCamera().catch(err=>{out.textContent='Camera error: '+err});
+loadCriteria();
+setInterval(loadCriteria, 5000);
+</script></body></html>"""
+
+
+VOICE_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meridian Voice Monitor</title>
+<style>
+body{margin:0;background:#0f1319;color:#e7edf5;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+main{max-width:980px;margin:0 auto;padding:24px}
+h1{font-size:22px;margin:0}.sub{color:#9aa8ba;margin:6px 0 18px}
+.panel{background:#171c24;border:1px solid #2b3545;border-radius:8px;padding:16px;margin-bottom:16px}
+button,input{border:1px solid #334155;border-radius:6px;background:#0b1017;color:#e7edf5;padding:10px}
+button{background:#2f6feb;border-color:#2f6feb;color:white;font-weight:700;cursor:pointer;margin-right:8px}
+button.danger{background:#7f1d1d;border-color:#991b1b}
+label{display:block;color:#9aa8ba;font-size:12px;margin:12px 0 4px}
+pre{white-space:pre-wrap;word-break:break-word;min-height:360px;background:#0b1017;border:1px solid #29313f;border-radius:8px;padding:12px}
+.row{display:grid;grid-template-columns:180px 1fr;gap:12px;align-items:end}
+.status{font-size:13px;color:#9cc7ff;margin-top:10px}
+.hint{font-size:12px;color:#8a98aa;margin-top:8px}
+</style>
+</head>
+<body><main>
+<h1>Meridian Voice Monitor</h1>
+<div class="sub">Continuous meeting listener. Voice requests and approvals are converted into Slack channel actions.</div>
+<section class="panel">
+<div class="row">
+  <div><label>Chunk seconds</label><input id="chunkSeconds" type="number" min="2" max="12" value="4"></div>
+  <div>
+    <button onclick="startListening()">Start listening</button>
+    <button class="danger" onclick="stopListening()">Stop</button>
+    <button onclick="resetVoice()">Reset state</button>
+  </div>
+</div>
+<div id="status" class="status">Stopped.</div>
+<div class="hint">Try: “Can I have your financial statement?” Then have the other side say “Yes, go ahead.” Meridian posts the approved financial summary to Slack.</div>
+</section>
+<section class="panel">
+<pre id="out">Ready.</pre>
+</section>
+</main>
+<script>
+let stream=null;
+let recorder=null;
+let listening=false;
+let cycleTimer=null;
+let chunkNo=0;
+const out=document.getElementById('out');
+const statusEl=document.getElementById('status');
+
+async function ensureMic(){
+  if(!stream){
+    stream=await navigator.mediaDevices.getUserMedia({audio:true,video:false});
+  }
+}
+
+async function startListening(){
+  await ensureMic();
+  listening=true;
+  statusEl.textContent='Listening...';
+  await recordOneChunk();
+}
+
+function stopListening(){
+  listening=false;
+  clearTimeout(cycleTimer);
+  if(recorder && recorder.state !== 'inactive') recorder.stop();
+  statusEl.textContent='Stopped.';
+}
+
+async function resetVoice(){
+  await fetch('/api/voice-reset',{method:'POST'});
+  out.textContent='Voice state reset.';
+}
+
+async function recordOneChunk(){
+  if(!listening) return;
+  const seconds=Math.max(2, Number(document.getElementById('chunkSeconds').value||4));
+  const chunks=[];
+  const mimeType=pickMimeType();
+  recorder=mimeType ? new MediaRecorder(stream,{mimeType}) : new MediaRecorder(stream);
+  recorder.ondataavailable=e=>{ if(e.data && e.data.size>0) chunks.push(e.data); };
+  recorder.onstop=async()=>{
+    if(chunks.length){
+      const blob=new Blob(chunks,{type:recorder.mimeType || 'audio/webm'});
+      await sendChunk(blob);
+    }
+    if(listening) cycleTimer=setTimeout(recordOneChunk,250);
+  };
+  recorder.start();
+  statusEl.textContent='Recording chunk '+(chunkNo+1)+'...';
+  setTimeout(()=>{ if(recorder && recorder.state !== 'inactive') recorder.stop(); }, seconds*1000);
+}
+
+function pickMimeType(){
+  const types=['audio/webm;codecs=opus','audio/webm','audio/mp4'];
+  return types.find(t=>MediaRecorder.isTypeSupported(t)) || '';
+}
+
+async function sendChunk(blob){
+  chunkNo += 1;
+  statusEl.textContent='Transcribing chunk '+chunkNo+'...';
+  const form=new FormData();
+  form.append('audio', blob, 'meeting-'+chunkNo+'.webm');
+  try{
+    const res=await fetch('/api/voice-chunk',{method:'POST',body:form});
+    const data=await res.json();
+    out.textContent=JSON.stringify(data,null,2);
+    statusEl.textContent='Chunk '+chunkNo+' complete. Action: '+(data.action || data.reason_code || 'none')+'. Pending: '+(data.voice && data.voice.pending_resource_id ? data.voice.pending_resource_id : 'none')+'.';
+  }catch(err){
+    statusEl.textContent='Voice monitor error: '+err;
+  }
+}
 </script></body></html>"""
 
 

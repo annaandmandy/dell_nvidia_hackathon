@@ -42,6 +42,31 @@ In a shared channel, mention the bot:
 
 In a DM, message the bot directly.
 
+### Continuous voice meeting monitor
+
+Run the local helper:
+
+```bash
+python app.py
+```
+
+Open:
+
+```text
+http://127.0.0.1:5050/voice
+```
+
+Click `Start listening`. Chrome records short audio chunks continuously and
+sends them to ASR. Meridian keeps meeting state. For example:
+
+```text
+Person A: Can I have your financial statement?
+Person B: Yes, go ahead.
+```
+
+Meridian detects the request, waits for explicit approval, then posts the
+approved financial summary into Slack.
+
 ### Continuous visual field inspection
 
 For webcam-based meeting and asset checks, run the local helper page:
@@ -58,11 +83,33 @@ http://127.0.0.1:5050/vision
 
 Click capture to inspect the room/assets. The result is posted back to Slack.
 Use `Start continuous monitoring` for ongoing checks. Chrome samples still
-frames at the chosen interval, and Meridian posts to Slack only when the state
-changes, when an alert persists, or when the heartbeat interval is reached. The
-default checklist asks whether two people are present, whether a cup or bottle
-appears metallic, and whether a desktop host/workstation/GPU box/server is
-visible.
+frames at the chosen interval and updates the checklist table. Meridian posts
+to Slack only at the end:
+
+- `ALLOW` when every configured checkbox is satisfied.
+- `DENY` when the monitor is manually stopped before all boxes are checked.
+
+The default checklist asks whether two people are present, whether a cup or
+bottle appears metallic, and whether a desktop host/workstation/GPU box/server
+is visible.
+
+Change visual audit conditions from Slack:
+
+```text
+@mergeops set visual criteria: people=2; metal cup=1; AI host=1
+```
+
+Chinese works too:
+
+```text
+@mergeops 修改审查条件：两个人；铁水杯；一台主机
+```
+
+Show current criteria:
+
+```text
+@mergeops show visual criteria
+```
 
 For laptop testing, add:
 
