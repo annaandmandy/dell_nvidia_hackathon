@@ -42,6 +42,37 @@ In a shared channel, mention the bot:
 
 In a DM, message the bot directly.
 
+### Continuous visual field inspection
+
+For webcam-based meeting and asset checks, run the local helper page:
+
+```bash
+python app.py
+```
+
+Open:
+
+```text
+http://127.0.0.1:5050/vision
+```
+
+Click capture to inspect the room/assets. The result is posted back to Slack.
+Use `Start continuous monitoring` for ongoing checks. Chrome samples still
+frames at the chosen interval, and Meridian posts to Slack only when the state
+changes, when an alert persists, or when the heartbeat interval is reached. The
+default checklist asks whether two people are present, whether a cup or bottle
+appears metallic, and whether a desktop host/workstation/GPU box/server is
+visible.
+
+For laptop testing, add:
+
+```bash
+OPENAI_API_KEY=...
+OPENAI_VISION_MODEL=gpt-4o-mini
+OPENAI_TTS_MODEL=gpt-4o-mini-tts
+OPENAI_TTS_VOICE=alloy
+```
+
 ### Optional local API UI
 
 The Flask UI/API is still available for fallback testing, but it is not the
