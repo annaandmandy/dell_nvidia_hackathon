@@ -36,7 +36,13 @@ values — MUST be answered by running this with the \`exec\` tool (no other too
     python3 $SKILL_DIR/meridian_cli.py --sender <SENDER_SLACK_ID> --dm|--channel \"<question verbatim>\"
 
 Use the sender's Slack user ID from message metadata, \`--dm\` for direct messages and \`--channel\` for shared
-channels. Reply with the script output as-is; never add numbers or documents it did not return, never soften a DENY.
+channels. Run it exactly ONCE per question.
+
+Reply format (mandatory):
+1. First line: copy the script's first line unchanged, e.g. '*Meridian* — \`ALLOW\` / \`ALLOW_JOINT_APPROVED\`'.
+   This decision label proves the policy engine ran — never drop or reword it.
+2. Then the rest of the script output. You may tidy wording, but never add numbers or documents it did not return,
+   and never soften a DENY.
 <!-- meridian-routing:end -->
 EOF
   grep -c 'meridian-routing' AGENTS.md
