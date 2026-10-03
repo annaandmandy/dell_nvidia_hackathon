@@ -3,6 +3,14 @@ from __future__ import annotations
 
 from typing import Any
 
+LABEL_ICON = {
+    "VERIFIED_FACT": ":white_check_mark:",
+    "CALCULATED_RESULT": ":abacus:",
+    "ASSUMPTION": ":memo:",
+    "NEUTRAL_ASSESSMENT": ":scales:",
+    "UNRESOLVED": ":warning:",
+}
+
 
 def format_response(result: dict[str, Any]) -> str:
     lines = [
@@ -10,47 +18,27 @@ def format_response(result: dict[str, Any]) -> str:
         result.get("answer", ""),
     ]
 
-    calc = result.get("calculated_results")
-    if calc:
-        lines += [
-            "",
-            "*Calculated results*",
-            f"• Combined revenue: `${calc['combined_revenue_m']:.1f}m`",
-            f"• Combined EBITDA: `${calc['combined_ebitda_m']:.1f}m`",
-            f"• EBITDA margin: `{calc['combined_ebitda_margin_pct']:.1f}%`",
-        ]
+    for sec in result.get("sections") or []:
+        icon = LABEL_ICON.get(sec["label"], "•")
+        lines += ["", f"{icon} *{sec['title']}* `{sec['label']}`"]
+        lines += [f"• {line}" for line in sec["lines"]]
 
-    assessment = result.get("neutral_assessment")
-    if assessment:
-        lines += [
-            "",
-            "*Neutral assessment facts*",
-            f"• Standalone range: `${assessment['standalone_value_range_m'][0]}m-${assessment['standalone_value_range_m'][1]}m`",
-            f"• Synergy NPV: `${assessment['five_year_net_synergy_npv_m']}m`",
-            f"• Bridge: {assessment['recommendation']}",
-            f"• {assessment['disclaimer']}",
-        ]
+    signatures = result.get("signatures") or []
+    if signatures:
+        lines += ["", ":lock: *Signature check (Ed25519)*"]
+        for sig in signatures:
+            mark = ":large_green_circle:" if sig["status"] == "VALID" else ":red_circle:"
+            lines.append(f"{mark} `{sig['payload']}` — {sig['status']} (issuer: {sig['issuer']}, "
+                         f"sha256 `{sig['payload_sha256'][:12]}…`)")
 
-    docs = result.get("retrieved_documents") or []
-    if docs:
-        lines += ["", "*Approved resources shown*"]
-        for doc in docs[:8]:
-            lines.append(f"• `{doc['resource_id']}` — {doc['title']} ({doc['classification']})")
+    if result.get("decision") == "DENY":
+        if result.get("alternative"):
+            lines += ["", f":arrow_right: {result['alternative']}"]
+        events = [e for e in result.get("safety_events") or [] if e != result.get("reason_code")]
+        if events:
+            lines.append(f":rotating_light: Logged: `{'`, `'.join(events)}`")
 
-    denied_docs = result.get("denied_documents") or []
-    if denied_docs:
-        lines += ["", "*Resources blocked by policy*"]
-        for doc in denied_docs[:8]:
-            lines.append(f"• `{doc['resource_id']}` — `{doc['reason_code']}`")
-
-    signature = result.get("signature")
-    if signature:
-        lines += [
-            "",
-            "*Signature check*",
-            f"• Resource: `{signature.get('resource_id')}`",
-            f"• Status: `{signature.get('signature_status')}`",
-            f"• Payload hash: `{signature.get('payload_hash')}`",
-        ]
+    if result.get("disclaimer"):
+        lines += ["", f"_{result['disclaimer']}_"]
 
     return "\n".join(lines).strip()

@@ -24,6 +24,11 @@ skills/install_meridian_skill.sh       # re-run after changing app.py / data/mer
 nemoclaw my-assistant logs --follow
 ```
 
+Meridian reads everything from `meridian_finance_ai_demo_bundle/` (registry, signed
+disclosures, joint-approved summaries, clean-room recompute). Signatures are checked with
+`ed25519_verify.py` (pure Python, so it also runs inside the sandbox). Acceptance checks
+(meeting script, the ten attack tests, figures): `python scripts/check_expected_results.py`.
+
 Identity lives in `data/roles.json` (HarborStone = Company A buyer, QuantaShield =
 Company B target). The skill maps the Slack sender to A/B and DM vs channel to
 `A_DM` / `B_DM` / `JOINT_SLACK`, exactly like `slack_bot.infer_context`.
@@ -55,7 +60,7 @@ python slack_bot.py
 In a shared channel, mention the bot:
 
 ```text
-@Meridian Pull the joint financial summary and calculate combined 2025 revenue and EBITDA margin.
+@Meridian Pull QuantaShield's commercial summary. Is the 115 million valuation supported?
 ```
 
 In a DM, message the bot directly.

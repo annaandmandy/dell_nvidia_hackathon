@@ -1,6 +1,6 @@
 ---
 name: meridian
-description: Meridian neutral M&A deal assistant (HarborStone Financial Group buyer / QuantaShield AI target) — meeting agenda, joint financials (revenue, EBITDA, margin), 96m vs 106m offer evaluation, board memo / walk-away price, data signature verification, and blocking cross-party disclosure. Use for any deal, diligence, valuation or confidential-data question.
+description: Meridian neutral M&A deal assistant (HarborStone Financial Group buyer / QuantaShield AI target) — agenda and approved documents, the $115m valuation, technology profitability, IP/legal risk, buyer funding reliability, Ed25519 signature checks, the neutral term structure, camera card checks, and blocking cross-party disclosure. Use for any deal, diligence, valuation or confidential-data question.
 metadata: {"openclaw": {"requires": {"bins": ["python3"]}}}
 ---
 

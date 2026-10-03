@@ -41,10 +41,13 @@ def main() -> None:
     where = p.add_mutually_exclusive_group(required=True)
     where.add_argument("--dm", action="store_true", help="message came from a direct message")
     where.add_argument("--channel", action="store_true", help="message came from a shared channel")
+    where.add_argument("--camera", action="store_true", help="question is a card marker read by the vision model")
     p.add_argument("question", nargs="+")
     args = p.parse_args()
 
     ctx = infer_context(args.sender, args.dm)
+    if args.camera:
+        ctx = Context(actor_id=args.sender, organization="NEUTRAL", channel_type="CAMERA", session_id="openclaw")
     result = handle_request(" ".join(args.question), ctx)
     print(format_response(result))
     print(f"\n_context: org={ctx.organization} channel={ctx.channel_type}_")
