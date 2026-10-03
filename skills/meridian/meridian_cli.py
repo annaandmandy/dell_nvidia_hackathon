@@ -31,7 +31,15 @@ HOST_API = os.environ.get("MERIDIAN_HOST_API", "http://host.openshell.internal:5
 
 
 NEW_ROOM_PHRASES = ("new deal", "start a new deal", "new demo", "reset the demo", "open a deal room")
-MEETING_PHRASES = ("start meeting", "start the meeting", "start a meeting", "open the meeting", "open a meeting")
+MEETING_PHRASES = ("new meeting", "start meeting", "start the meeting", "start a meeting", "open the meeting", "open a meeting")
+
+
+def is_command(question: str, phrases: tuple[str, ...]) -> bool:
+    """Only a message that *starts* with the phrase triggers it ('what is the new meeting time?' does not)."""
+    q = question.lower().strip(" .!?")
+    for prefix in ("please ", "let's ", "lets ", "meridian, ", "meridian "):
+        q = q.removeprefix(prefix)
+    return any(q.startswith(p) for p in phrases)
 
 
 def host_post(path: str, body: dict | None = None) -> dict:
@@ -71,11 +79,11 @@ def main() -> None:
     args = p.parse_args()
 
     question = " ".join(args.question)
-    if any(p in question.lower() for p in NEW_ROOM_PHRASES):
+    if is_command(question, NEW_ROOM_PHRASES):
         room = host_post("/api/deal-room/reset", {"announce": False, "actor_id": args.sender})
         print(f"*Meridian* — `ALLOW` / `DEAL_ROOM_OPENED`\n{room['announcement']}")
         return
-    if any(p in question.lower() for p in MEETING_PHRASES):
+    if is_command(question, MEETING_PHRASES):
         room = host_post("/api/room/start", {"announce": False, "actor_id": args.sender})
         print(f"*Meridian* — `ALLOW` / `MEETING_STARTED`\n{room['announcement']}")
         return
