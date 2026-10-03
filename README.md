@@ -93,14 +93,14 @@ In a DM, message the bot directly.
 python app.py        # then open http://127.0.0.1:5050/deal-room
 ```
 
-`New deal room` (or `@MergeOps start a new deal room` in Slack) clears uploads, archives the
+`New deal room` (or `@Meridian start a new deal room` in Slack) clears uploads, archives the
 audit trail and resets the meeting monitors. Each party then uploads one signed disclosure:
 
 - HarborStone: `meridian_finance_ai_demo_bundle/signed_inputs/buyer_reliability_authorized.json`
 - QuantaShield: `meridian_finance_ai_demo_bundle/signed_inputs/startup_commercial_authorized.json`
 - Tamper demo: `ATTACK_tampered_startup_metrics.json` (ARR 11.8 → 15.8) is rejected as INVALID
 
-`@MergeOps new deal` opens the room and the bot DMs every person in `data/roles.json` a
+`@Meridian new deal` opens the room and the bot DMs every person in `data/roles.json` a
 personal link (`http://<gb10-ip>:5050/deal-room?t=<token>`). Only that person can read their DM,
 so the token stands for their Slack identity: the page shows who is signed in, only their own
 party's card accepts uploads, the party is taken from the token (not the form), and the audit
@@ -167,19 +167,19 @@ is visible.
 Change visual audit conditions from Slack:
 
 ```text
-@mergeops set visual criteria: people=2; metal cup=1; AI host=1
+@Meridian set visual criteria: people=2; metal cup=1; AI host=1
 ```
 
 Chinese works too:
 
 ```text
-@mergeops 修改审查条件：两个人；铁水杯；一台主机
+@Meridian 修改审查条件：两个人；铁水杯；一台主机
 ```
 
 Show current criteria:
 
 ```text
-@mergeops show visual criteria
+@Meridian show visual criteria
 ```
 
 On the GB10 everything is local: vision uses the Qwen3.6 VLM on vLLM (:8000), ASR uses

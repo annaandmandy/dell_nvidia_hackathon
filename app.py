@@ -1141,7 +1141,7 @@ def format_criteria_response(criteria) -> str:
         "The Chrome monitoring UI will refresh automatically.\n\n"
         f"{format_criteria_table(criteria)}\n\n"
         "Example update command:\n"
-        "`@mergeops set visual criteria: people=2; metal cup=1; AI host=1`"
+        "`@Meridian set visual criteria: people=2; metal cup=1; AI host=1`"
     )
 
 
@@ -1586,7 +1586,7 @@ def run_clean_room(ctx: Context) -> dict[str, Any]:
                   f"*Assets to verify on camera in the meeting* (<{report_url('assets')}|asset report>)\n"
                   + "\n".join(f"• `{a['asset_id']}` {a['object']} ×{a['target_count']} — {a['description']}" for a in assets)
                   + "\n\nAsk me about the other side's report here — raw records stay private. "
-                  "When you're ready: `@MergeOps new meeting`.")
+                  "When you're ready: `@Meridian new meeting`.")
     return summary
 
 
@@ -1747,7 +1747,12 @@ def room_speech(person: dict[str, str], text: str) -> dict[str, Any]:
                    decision="ALLOW", reason_code=result["reason_code"])
         return {"action": "owner_disclosure"}
 
-    rid = report_mention(text)
+    prev = next((x["text"] for x in reversed(MEETING_ROOM["transcript"][:-1]) if x["user"] == person["user"]), "")
+    rid = report_mention(text) or report_mention(f"{prev} {text}")
+    last = MEETING_ROOM.get("shared") or {}
+    if rid and last.get("report_id") == rid and \
+            (datetime.now(timezone.utc) - datetime.fromisoformat(last["t"])).total_seconds() < 60:
+        rid = None  # already on screen
     if rid:
         title = REPORTS[rid]["title"]
         post_to_slack(f":page_facing_up: *Meeting `{MEETING_ROOM['id']}`* — {speaker} mentioned the {title}; "
@@ -1898,6 +1903,38 @@ def end_meeting(by: str) -> dict[str, Any]:
             f"_{DISCLAIMER}_",
         ]
         report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        assets_line = lambda c: (f"{c['object']} {c.get('current_count', 0)}/{c['target_count']} — "
+                                 + ("Verified" if c.get("completed") else "Not verified")
+                                 + (f" via {MEETING_ROOM['asset_owner'][c['id']]}" if c["id"] in MEETING_ROOM["asset_owner"] else ""))
+        structured = {
+            "meeting_id": mid,
+            "answer": (f"Meeting {mid}: {', '.join(f'{n} ({c})' for n, c in people.items()) or 'no speakers'}. "
+                       f"{len(MEETING_ROOM['transcript'])} attributed utterances, {len(released)} releases, "
+                       f"{len(denied_)} denials. Ended by {by}."),
+            "sections": [
+                section("VERIFIED_FACT", "Material released",
+                        [f"{e['text']}: “{e.get('request', '')}” ({e.get('reason_code')})" for e in released] or ["None"]),
+                section("VERIFIED_FACT", "Requests denied by policy",
+                        [f"{e.get('by')}: “{e.get('request')}” ({e.get('reason_code')})" for e in denied_] or ["None"]),
+                section("VERIFIED_FACT", "Reports shared in the meeting",
+                        [e["text"] for e in events if e["kind"] == "shared"] or ["None"]),
+                section("VERIFIED_FACT", "On-site asset verification", [assets_line(c) for c in criteria]),
+                section("UNRESOLVED", "Next steps — closing conditions", terms["closing_conditions"]),
+                section("UNRESOLVED", "Open risk items and agreed responses",
+                        [f"[{i['risk'].upper()}] {i['issue']} → {i['deal_response']}" for i in ip["high_or_critical_items"]]),
+                section("CALCULATED_RESULT", "Proposed structure on the table", [
+                    f"{m(terms['cash_to_sellers_at_close_usd_m'])} cash at close + {m(terms['ip_compliance_escrow_usd_m'])} "
+                    f"escrow + up to {m(terms['performance_earnout_usd_m'])} earnout (headline up to "
+                    f"{m(terms['neutral_headline_ev_usd_m'])})"]),
+                section("NEUTRAL_ASSESSMENT", "Next meeting",
+                        [f"Proposed: {next_meeting}, same participants — review closing-condition evidence."]),
+                section("VERIFIED_FACT", "Attributed transcript",
+                        [f"[{x['t'][11:19]}] {x['name']} ({PARTY[x['party']]}): {x['text']}" for x in MEETING_ROOM["transcript"]]
+                        or ["No speech captured."]),
+            ],
+            "signatures": [],
+        }
+        (out_dir / "latest_report.json").write_text(json.dumps(structured, indent=2), encoding="utf-8")
         audit_decision(Context(by, "NEUTRAL", "JOINT_MEETING", session_id=mid), "ALLOW", "MEETING_ENDED",
                        tool="meeting_room", releases=len(released), denials=len(denied_))
         post_to_slack(
@@ -1907,10 +1944,11 @@ def end_meeting(by: str) -> dict[str, Any]:
             f"Assets verified: {sum(bool(c.get('completed')) for c in criteria)}/{len(criteria)}\n"
             "*Next steps*\n" + "\n".join(f"• {c}" for c in terms["closing_conditions"])
             + f"\n*Next meeting:* {next_meeting} — review closing-condition evidence.\n"
-            f"Full report and attributed transcript: `{report_path.name}`, `{transcript_path.name}` on the GB10."
+            f"<{report_url('meeting')}|Open the full meeting report> (with the attributed transcript)"
         )
         MEETING_ROOM["ended"] = {"report_url": f"/media/meetings/{report_path.name}",
-                                 "transcript_url": f"/media/meetings/{transcript_path.name}", "next_meeting": next_meeting}
+                                 "transcript_url": f"/media/meetings/{transcript_path.name}",
+                                 "report_page": "/report/meeting", "next_meeting": next_meeting}
         return MEETING_ROOM["ended"]
 
 
@@ -2006,7 +2044,16 @@ REPORTS: dict[str, dict[str, Any]] = {
                        "build": lambda: _report_from(term_structure, "term-structure")},
     "assets": {"title": "Asset Verification Report", "blurb": "assets to show on camera",
                "build": build_asset_report},
+    "meeting": {"title": "Meeting Report", "blurb": "decisions, assets, next steps and the attributed transcript",
+                "build": lambda: build_meeting_report()},
 }
+
+
+def build_meeting_report() -> dict[str, Any]:
+    path = DATA_DIR / "meetings" / "latest_report.json"
+    if not path.exists():
+        return {"answer": "No meeting has ended yet.", "sections": [], "signatures": []}
+    return json.loads(path.read_text())
 # Spoken names that pull a report up in the meeting (joint-approved: no extra consent needed).
 REPORT_MENTIONS = [
     ("joint-summary", ("joint statement", "joint summary", "joint report", "clean room report", "clean-room report")),
@@ -2019,11 +2066,19 @@ REPORT_MENTIONS = [
 ]
 
 
+JOINT_NOUNS = ("statement", "summary", "report", "data", "results", "findings", "outputs")
+
+
 def report_mention(text: str) -> str | None:
-    t = text.lower()
+    t = " ".join(text.lower().split())
     for rid, phrases in REPORT_MENTIONS:
         if any(p in t for p in phrases):
             return rid
+    # Looser, natural phrasing for the 共同摘要: "our joint data", "M&A results", "the meeting summary" …
+    if re.search(r"\bjoint\b(?:\W+\w+){0,3}?\W+(" + "|".join(JOINT_NOUNS) + r")\b", t) \
+            or re.search(r"\b(m&a|m and a|deal|clean[- ]room)\s+(results|summary|findings)\b", t) \
+            or re.search(r"\b(meeting|last meeting)\s+summary\b", t):
+        return "joint-summary"
     return None
 
 
@@ -2372,7 +2427,8 @@ if app:
             text = transcribe_audio(audio.read(), "chunk.wav", "audio/wav")
         except Exception as exc:
             return jsonify({"error": str(exc)}), 502
-        if not text or text.strip().lower().strip(".!? ") in {"", "you", "thank you", "thanks for watching", "bye"}:
+        text = re.sub(r"\*[^*]*\*|\[[^\]]*\]|\([^)]*\)|♪+", " ", text or "").strip()
+        if not text or text.lower().strip(".!? ") in {"", "you", "thank you", "thanks for watching", "bye", "so", "uh", "um"}:
             return jsonify({"action": "silence"})
         with ROOM_LOCK:
             return jsonify({"text": text, **room_speech(me, text)})
@@ -2589,7 +2645,7 @@ audio{width:100%;margin-top:10px}
 <tbody id="criteriaBody"></tbody>
 </table>
 <label>Latest model output</label>
-<pre id="out">Ready. Mention @mergeops in Slack to change criteria, or monitor with defaults.</pre>
+<pre id="out">Ready. Mention @Meridian in Slack to change criteria, or monitor with defaults.</pre>
 </section>
 </div>
 </main>
@@ -2997,7 +3053,7 @@ function applyIdentity(me){
 
 async function resetRoom(){
   const resp=await fetch('/api/deal-room/reset',{method:'POST'});
-  if(resp.status===403){alert('Only the host (GB10) or @MergeOps "new deal" can open a new deal room.');return}
+  if(resp.status===403){alert('Only the host (GB10) or @Meridian "new deal" can open a new deal room.');return}
   location.reload();
   return;
   ['A','B'].forEach(p=>{setStatus(p,null,'Waiting for upload.');renderPkg(p,[])});
@@ -3599,7 +3655,7 @@ async function endMeeting(){
 function showEnded(r){
   if(!r || ended) return; ended=true;
   $('report').hidden=false;
-  $('report').innerHTML='<b>Meeting ended.</b> The report and next steps were posted to Slack. Next meeting proposed: <b>'+esc(r.next_meeting||'—')+'</b>.';
+  $('report').innerHTML='<b>Meeting ended.</b> The report and next steps were posted to Slack. Next meeting proposed: <b>'+esc(r.next_meeting||'—')+'</b>. <a class="btn" style="margin-left:8px" href="/report/meeting?t='+encodeURIComponent(T)+'" target="_blank" rel="noopener">Open meeting report</a>';
   ['micBtn','camBtn','verifyBtn'].forEach(id=>$(id).disabled=true);
   resetPc(); if(stream) stream.getTracks().forEach(t=>t.stop());
 }

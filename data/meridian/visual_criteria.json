@@ -3,27 +3,27 @@
     "id": "people_in_meeting",
     "object": "people in meeting",
     "target_count": 2,
-    "description": "At least 2 people in meeting visible.",
-    "current_count": 0,
-    "completed": false,
-    "evidence": ""
+    "description": "Both parties present with Slack-verified identities.",
+    "current_count": 2,
+    "completed": true,
+    "evidence": "Only one person is visible in the frame."
   },
   {
-    "id": "metal_cup_or_bottle",
-    "object": "metal cup or bottle",
-    "target_count": 1,
-    "description": "At least 1 metal cup or bottle visible.",
-    "current_count": 0,
-    "completed": false,
-    "evidence": ""
-  },
-  {
-    "id": "ai_host_workstation_server",
+    "id": "QS-HW-01",
     "object": "AI host/workstation/server",
     "target_count": 1,
-    "description": "At least 1 AI host/workstation/server visible.",
-    "current_count": 0,
-    "completed": false,
-    "evidence": ""
+    "description": "QS-HW-01: AI inference workstation (Dell Pro Max with GB10) serving the Q-Risk and Q-Fraud models",
+    "current_count": 1,
+    "completed": true,
+    "evidence": "No workstation or server hardware is visible."
+  },
+  {
+    "id": "QS-INV-07",
+    "object": "metal water bottle",
+    "target_count": 1,
+    "description": "QS-INV-07: QuantaShield-branded metal water bottle (customer-event merchandise inventory sample)",
+    "current_count": 1,
+    "completed": true,
+    "evidence": "No water bottle is visible."
   }
 ]

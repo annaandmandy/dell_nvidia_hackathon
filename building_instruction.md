@@ -704,7 +704,7 @@ curl http://localhost:8000/v1/models
 1. `bash start.sh`
 2. Open War Room: http://localhost:3001
 3. Open Approval: http://localhost:3000
-4. **@MergeOps status** → Slack confirms alive
+4. **@Meridian status** → Slack confirms alive
 5. War Room: click Start Meeting
 6. Speak / inject: *"Let's move all the Orbit EU users to the Northstar US environment next week"*
 7. Watch: GDPR card appears, risk score rises
@@ -714,7 +714,7 @@ curl http://localhost:8000/v1/models
 11. Anna approves as Northstar → Carrie approves as Orbit
 12. Watch: OpenShell releases block, action items generated, Slack notification sent
 13. Edit `northstar_users.csv` → within 60s DataWatcher fires Slack alert
-14. **@MergeOps who is Carrie** → identity lookup demo
+14. **@Meridian who is Carrie** → identity lookup demo
 
 ---
 
