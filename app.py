@@ -1281,7 +1281,8 @@ def ingest_upload(party: str, filename: str, raw: bytes, ctx: Context) -> dict[s
                                "received_at": datetime.now(timezone.utc).isoformat()}
     audit_decision(ctx, "ALLOW", "ALLOW_VALID_SIGNATURE", tool="deal_room", party=party, payload=filename,
                    package_files=len(package))
-    post_to_slack(f":large_green_circle: *Deal room* — {PARTY[party]} submitted `{filename}`: Ed25519 signature "
+    who = f" (uploaded by <@{ctx.actor_id}>)" if ctx.actor_id.startswith("U") else ""
+    post_to_slack(f":large_green_circle: *Deal room* — {PARTY[party]}{who} submitted `{filename}`: Ed25519 signature "
                   f"*VALID* (issuer {sig['issuer']}). Data package registered: {len(package)} private files "
                   f"({party}_PRIVATE — never shown to the other side).")
 
@@ -1331,27 +1332,69 @@ def reset_deal_room(ctx: Context, announce: bool = True) -> dict[str, Any]:
         AUDIT_PATH.rename(AUDIT_PATH.with_name(f"audit-{datetime.now():%Y%m%d-%H%M%S}.jsonl"))
     save_visual_criteria(load_visual_criteria(), reset_progress=True)
     VOICE_MONITOR_STATE.update({"active": False, "chunk_count": 0, "pending_request_text": None, "last_action": "reset"})
-    # The link token is the only way in from the LAN; a new room revokes the previous link.
+    # Each registered person gets a personal link by Slack DM. Only that person can read their DM, so
+    # holding the token proves the Slack identity (magic-link style); the token fixes the party.
+    tokens = {secrets.token_urlsafe(12): person for person in deal_room_people()}
     state = {"room_id": f"DR-{uuid.uuid4().hex[:6].upper()}", "opened_at": datetime.now(timezone.utc).isoformat(),
-             "token": secrets.token_urlsafe(9), "parties": {}, "clean_room": None}
+             "tokens": tokens, "parties": {}, "clean_room": None}
     save_deal_room_state(state)
     audit_decision(ctx, "ALLOW", "DEAL_ROOM_OPENED", tool="deal_room", room_id=state["room_id"])
-    state["upload_url"] = deal_room_url(state["token"])
-    state["announcement"] = deal_room_announcement(state["room_id"], state["upload_url"])
+    dms = {person["user"]: post_dm(person["user"], upload_link_dm(state["room_id"], person, deal_room_url(token)))
+           for token, person in tokens.items()}
+    state["dm_results"] = {uid: r.get("ok") for uid, r in dms.items()}
+    state["announcement"] = deal_room_announcement(state["room_id"], tokens.values())
     if announce:  # from the page button; when Slack asked, the agent's own reply carries it
         post_to_slack(state["announcement"])
     return state
 
 
-def deal_room_announcement(room_id: str, url: str) -> str:
+def deal_room_people() -> list[dict[str, str]]:
+    roles = json.loads((ROOT / "data" / "roles.json").read_text())
+    people = []
+    for uid, user in roles["users"].items():
+        company = roles["companies"].get(user["company"], {})
+        if company.get("org") in {"A", "B"}:
+            people.append({"user": uid, "name": user["name"], "title": user["display_title"],
+                           "party": company["org"], "company": company["name"]})
+    return people
+
+
+def deal_room_identity(token: str | None) -> dict[str, str] | None:
+    tokens = deal_room_state().get("tokens") or {}
+    for known, person in tokens.items():
+        if token and secrets.compare_digest(token, known):
+            return person
+    return None
+
+
+def post_dm(user_id: str, text: str) -> dict[str, Any]:
+    """DM via chat.postMessage to the user ID (needs the bot token and im:write)."""
+    if requests is None or not SLACK_BOT_TOKEN:
+        return {"ok": False, "error": "slack_not_configured"}
+    resp = requests.post("https://slack.com/api/chat.postMessage",
+                         headers={"Authorization": f"Bearer {SLACK_BOT_TOKEN}"},
+                         json={"channel": user_id, "text": text}, timeout=10)
+    data = resp.json()
+    return {"ok": bool(data.get("ok")), "error": data.get("error")}
+
+
+def upload_link_dm(room_id: str, person: dict[str, str], url: str) -> str:
+    return (f":closed_lock_with_key: *Your personal upload link — deal room `{room_id}`*\n"
+            f"Signed in as *{person['name']}* ({person['title']}, {person['company']}).\n{url}\n"
+            "This link identifies you — uploads through it are recorded under your Slack account. "
+            "Don't share it; it expires when a new deal room is opened.")
+
+
+def deal_room_announcement(room_id: str, people: Any) -> str:
+    names = ", ".join(f"{p['name']} ({p['company']})" for p in people)
     return (f":handshake: *New deal room `{room_id}` started* — HarborStone Financial Group (buyer) × "
             "QuantaShield AI (target). Meridian is the neutral party.\n"
-            f"Please upload your data here: {url}\n"
+            f"I've sent a personal upload link by DM to {names}. The link is tied to your Slack account, "
+            "so every upload is attributed to you.\n"
             "• HarborStone: your signed buyer reliability disclosure\n"
             "• QuantaShield: your signed commercial disclosure\n"
             "I verify every signature on arrival and run the clean room once both sides are in. "
             "Private data stays with its owner; only approved aggregates are shared.")
-
 
 
 # The OpenClaw sandbox reaches this host as host.openshell.internal (a Docker bridge address).
@@ -1377,8 +1420,7 @@ def request_allowed(remote_addr: str | None, path: str, token: str | None = None
         return True
     if addr in SANDBOX_NETWORK and path in SANDBOX_PATHS:
         return True
-    room_token = deal_room_state().get("token")
-    return path in LAN_DEAL_ROOM_PATHS and bool(room_token) and secrets.compare_digest(token or "", room_token)
+    return path in LAN_DEAL_ROOM_PATHS and deal_room_identity(token) is not None
 
 
 if app:
@@ -1544,15 +1586,23 @@ if app:
 
     @app.route("/api/deal-room", methods=["GET"])
     def deal_room_status():
-        return jsonify({k: v for k, v in deal_room_state().items() if k != "token"})
+        state = {k: v for k, v in deal_room_state().items() if k != "tokens"}
+        state["me"] = deal_room_identity(request.args.get("t"))  # None = host (moderator) view on the GB10
+        return jsonify(state)
 
     @app.route("/api/deal-room/upload", methods=["POST"])
     def deal_room_upload():
-        party = (request.form.get("party") or "").upper()
         upload = request.files.get("file")
+        me = deal_room_identity(request.args.get("t") or request.form.get("t"))
+        if me:
+            party, actor = me["party"], me["user"]  # the token decides, not the form
+        elif ipaddress.ip_address(request.remote_addr or "0.0.0.0").is_loopback:
+            party, actor = (request.form.get("party") or "").upper(), "host-moderator"
+        else:
+            return jsonify({"error": "forbidden"}), 403
         if party not in {"A", "B"} or not upload:
             return jsonify({"error": "party (A|B) and file are required"}), 400
-        ctx = Context(actor_id=f"deal-room-{party}", organization=party, channel_type=f"{party}_DM", session_id="deal-room")
+        ctx = Context(actor_id=actor, organization=party, channel_type=f"{party}_DM", session_id="deal-room")
         return jsonify(ingest_upload(party, upload.filename or "disclosure.json", upload.read(), ctx))
 
     @app.route("/api/deal-room/reset", methods=["POST"])
@@ -1975,8 +2025,9 @@ ul.pkg li span:last-child{color:var(--muted);font-size:12px}
     <h1>Meridian Deal Room <span class="synthetic">SYNTHETIC DEMO DATA</span></h1>
     <p class="sub">HarborStone Financial Group (buyer) × QuantaShield AI (target) — Meridian is the neutral party.</p>
     <div class="room" id="room">No deal room open.</div>
+    <div class="room" id="who"></div>
   </div>
-  <button class="primary" onclick="resetRoom()">New deal room</button>
+  <button class="primary" id="reset-btn" onclick="resetRoom()">New deal room</button>
 </header>
 
 <div class="grid">
@@ -2029,11 +2080,23 @@ async function upload(p,file){
   load();
 }
 
+let identityApplied=false;
+function applyIdentity(me){
+  if(identityApplied) return; identityApplied=true;
+  const who=document.getElementById('who');
+  if(!me){who.textContent='Host view (GB10) — both parties';return}
+  who.innerHTML='Signed in via Slack as <b>'+esc(me.name)+'</b> — '+esc(me.title)+' · '+esc(me.company);
+  const other=me.party==='A'?'B':'A';
+  const d=document.getElementById('drop-'+other);
+  d.innerHTML='Only '+esc(NAMES[other])+' can upload here.'; d.style.cursor='default'; d.style.opacity=.5;
+  d.replaceWith(d.cloneNode(true));
+  document.getElementById('card-'+me.party).style.boxShadow='0 0 0 2px var(--c)';
+  document.getElementById('reset-btn').style.display='none';
+}
+
 async function resetRoom(){
   const resp=await fetch('/api/deal-room/reset',{method:'POST'});
   if(resp.status===403){alert('Only the host (GB10) or @MergeOps "new deal" can open a new deal room.');return}
-  const room=await resp.json();
-  history.replaceState(null,'','?t='+encodeURIComponent(room.token));
   location.reload();
   return;
   ['A','B'].forEach(p=>{setStatus(p,null,'Waiting for upload.');renderPkg(p,[])});
@@ -2045,6 +2108,7 @@ async function load(){
   const resp=await fetch('/api/deal-room'+q);
   if(resp.status===403){document.getElementById('room').textContent='This link has expired — a new deal room was opened. Use the latest link in Slack.';return}
   const s=await resp.json();
+  applyIdentity(s.me);
   document.getElementById('room').textContent=s.room_id?('Deal room '+s.room_id+' · opened '+new Date(s.opened_at).toLocaleTimeString()):'No deal room open.';
   if(lastRoom && s.room_id!==lastRoom){['A','B'].forEach(p=>{setStatus(p,null,'Waiting for upload.');renderPkg(p,[])})}
   lastRoom=s.room_id;
