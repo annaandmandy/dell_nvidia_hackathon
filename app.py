@@ -157,20 +157,25 @@ def load_registry() -> dict[str, dict[str, Any]]:
     return {r["resource_id"]: r for r in rows}
 
 
-def verify_signed(key: str) -> dict[str, Any]:
-    payload_rel, sig_rel, key_rel = SIGNED[key]
-    data = _json(payload_rel)
+def verify_payload(data: dict[str, Any], key: str, name: str) -> dict[str, Any]:
+    """Ed25519-verify a payload against the registered detached signature and issuer key for `key`."""
+    _, sig_rel, key_rel = SIGNED[key]
     canonical = json.dumps(data, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
     signature = base64.b64decode((BUNDLE / sig_rel).read_text(encoding="ascii").strip())
     ok = ed25519_verify(public_key_from_pem((BUNDLE / key_rel).read_text()), canonical, signature)
     return {
-        "payload": Path(payload_rel).name,
+        "payload": name,
         "issuer": data.get("issuer", "Meridian calculation service"),
         "status": "VALID" if ok else "INVALID",
         "payload_sha256": hashlib.sha256(canonical).hexdigest(),
         "approved_at": data.get("approved_at") or data.get("generated_at"),
         "data": data,
     }
+
+
+def verify_signed(key: str) -> dict[str, Any]:
+    payload_rel = SIGNED[key][0]
+    return verify_payload(_json(payload_rel), key, Path(payload_rel).name)
 
 
 def clean_room_recompute() -> dict[str, Any]:
@@ -1194,13 +1199,141 @@ def process_voice_transcript(transcript: str) -> dict[str, Any]:
     }
 
 
+# ── deal room: each party uploads one signed disclosure; the rest of its package is read locally ──
+
+DEAL_ROOM_DIR = DATA_DIR / "deal_room"
+DEAL_ROOM_STATE = DEAL_ROOM_DIR / "state.json"
+PARTY_PACKAGE_DIR = {"A": "data/private_a", "B": "data/private_b"}
+# Which registered signature/key an uploaded payload is checked against, by issuer and content.
+UPLOAD_SIGNATURES = [
+    ("A", "HarborStone Financial Group", "buyer_reliability", "buyer_reliability"),
+    ("B", "QuantaShield AI", "financial_and_commercial", "startup_commercial"),
+    ("B", "QuantaShield AI", "ip_and_legal_summary", "startup_ip"),
+]
+
+
+def deal_room_state() -> dict[str, Any]:
+    if DEAL_ROOM_STATE.exists():
+        return json.loads(DEAL_ROOM_STATE.read_text())
+    return {"room_id": None, "opened_at": None, "parties": {}, "clean_room": None}
+
+
+def save_deal_room_state(state: dict[str, Any]) -> None:
+    DEAL_ROOM_DIR.mkdir(parents=True, exist_ok=True)
+    DEAL_ROOM_STATE.write_text(json.dumps(state, indent=2))
+
+
+def party_package(party: str) -> list[dict[str, str]]:
+    """The rest of the party's data room, registered from local disk (demo: not re-uploaded)."""
+    files = sorted((BUNDLE / PARTY_PACKAGE_DIR[party]).iterdir())
+    classification = f"{party}_PRIVATE"
+    return [{"file": f.name, "classification": classification} for f in files if f.is_file()]
+
+
+def ingest_upload(party: str, filename: str, raw: bytes, ctx: Context) -> dict[str, Any]:
+    party = party.upper()
+    state = deal_room_state()
+    try:
+        data = json.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError):
+        audit_decision(ctx, "DENY", "DENY_UNREADABLE_UPLOAD", tool="deal_room", party=party)
+        return {"decision": "DENY", "reason_code": "DENY_UNREADABLE_UPLOAD", "answer": "Not a JSON disclosure."}
+
+    match = next((key for p, issuer, field, key in UPLOAD_SIGNATURES
+                  if p == party and data.get("issuer") == issuer and field in data), None)
+    if not match:
+        audit_decision(ctx, "DENY", "DENY_ISSUER_MISMATCH", tool="deal_room", party=party, payload=filename)
+        post_to_slack(f":red_circle: *Deal room* — {PARTY[party]} upload `{filename}` rejected: "
+                      "the uploader is not the registered issuer of this disclosure.")
+        return {"decision": "DENY", "reason_code": "DENY_ISSUER_MISMATCH",
+                "answer": f"{PARTY[party]} can only submit disclosures it issued and signed."}
+
+    sig = verify_payload(data, match, filename)
+    sig_public = {k: v for k, v in sig.items() if k != "data"}
+    if sig["status"] != "VALID":
+        audit_decision(ctx, "DENY", "DENY_INVALID_SIGNATURE", tool="deal_room", party=party, payload=filename)
+        post_to_slack(f":red_circle: *Deal room* — {PARTY[party]} upload `{filename}` *rejected*: Ed25519 signature "
+                      f"INVALID (sha256 `{sig['payload_sha256'][:12]}…`). The file was modified after signing; "
+                      "it is excluded from every calculation.")
+        return {"decision": "DENY", "reason_code": "DENY_INVALID_SIGNATURE", "signature": sig_public,
+                "answer": "Signature INVALID — this file does not match what the issuer signed. Rejected."}
+
+    DEAL_ROOM_DIR.mkdir(parents=True, exist_ok=True)
+    (DEAL_ROOM_DIR / f"{party}_{Path(filename).name}").write_bytes(raw)
+    package = party_package(party)
+    state["parties"][party] = {"disclosure": filename, "signature": sig_public, "package": package,
+                               "received_at": datetime.now(timezone.utc).isoformat()}
+    audit_decision(ctx, "ALLOW", "ALLOW_VALID_SIGNATURE", tool="deal_room", party=party, payload=filename,
+                   package_files=len(package))
+    post_to_slack(f":large_green_circle: *Deal room* — {PARTY[party]} submitted `{filename}`: Ed25519 signature "
+                  f"*VALID* (issuer {sig['issuer']}). Data package registered: {len(package)} private files "
+                  f"({party}_PRIVATE — never shown to the other side).")
+
+    result: dict[str, Any] = {"decision": "ALLOW", "reason_code": "ALLOW_VALID_SIGNATURE",
+                              "signature": sig_public, "package": package}
+    if {"A", "B"} <= set(state["parties"]) and not state.get("clean_room"):
+        state["clean_room"] = run_clean_room(ctx)
+        result["clean_room"] = state["clean_room"]
+    save_deal_room_state(state)
+    result["state"] = state
+    return result
+
+
+def run_clean_room(ctx: Context) -> dict[str, Any]:
+    rc = clean_room_recompute()
+    receipt = verify_signed("calculation_receipt")
+    outputs = ["STARTUP_COMMERCIAL_SUMMARY", "VALUATION_ANALYSIS", "IP_LEGAL_SUMMARY", "BUYER_RELIABILITY_SUMMARY"]
+    lo, hi = rc["risk_adjusted_range_usd_m"]
+    summary = {
+        "ran_at": datetime.now(timezone.utc).isoformat(),
+        "outputs": outputs,
+        "receipt": receipt["status"],
+        "highlights": [
+            f"Production ARR {m(rc['production_arr_usd_m'])}; top-three concentration {rc['top_three_concentration_pct']}%",
+            f"Risk-adjusted standalone range {m(lo)}–{m(hi)}; DCF {m(rc['dcf_enterprise_value_usd_m'])}",
+            f"Five-year net synergy NPV {m(rc['five_year_net_synergy_npv_usd_m'])}",
+            f"Buyer funding coverage {rc['buyer_funding_coverage_x']}x",
+        ],
+    }
+    audit_decision(ctx, "ALLOW", "CLEAN_ROOM_RUN", tool="deal_room", outputs=outputs, receipt=receipt["status"])
+    post_to_slack(":lock: *Clean room complete* — both parties' private data processed inside Meridian; "
+                  "only approved aggregates leave.\n"
+                  + "\n".join(f"• {h}" for h in summary["highlights"])
+                  + f"\nJoint-approved outputs: {', '.join(f'`{o}`' for o in outputs)}"
+                  + f"\nCalculation receipt signature: *{receipt['status']}*\n"
+                  "Ask me about the other side's report in Slack — raw records stay private.")
+    return summary
+
+
+def reset_deal_room(ctx: Context) -> dict[str, Any]:
+    """Start a fresh demo: clear uploads, archive the audit trail, reset the meeting monitors."""
+    if DEAL_ROOM_DIR.exists():
+        for f in DEAL_ROOM_DIR.iterdir():
+            if f.is_file():
+                f.unlink()
+    if AUDIT_PATH.exists():
+        AUDIT_PATH.rename(AUDIT_PATH.with_name(f"audit-{datetime.now():%Y%m%d-%H%M%S}.jsonl"))
+    save_visual_criteria(load_visual_criteria(), reset_progress=True)
+    VOICE_MONITOR_STATE.update({"active": False, "chunk_count": 0, "pending_request_text": None, "last_action": "reset"})
+    state = {"room_id": f"DR-{uuid.uuid4().hex[:6].upper()}", "opened_at": datetime.now(timezone.utc).isoformat(),
+             "parties": {}, "clean_room": None}
+    save_deal_room_state(state)
+    audit_decision(ctx, "ALLOW", "DEAL_ROOM_OPENED", tool="deal_room", room_id=state["room_id"])
+    post_to_slack(f":handshake: *New deal room `{state['room_id']}`* — HarborStone Financial Group (buyer) × "
+                  "QuantaShield AI (target). Meridian is the neutral party.\n"
+                  "Each side: submit your signed disclosure in the deal room. Private data stays private; "
+                  "only approved aggregates are shared.")
+    return state
+
+
+
 # The OpenClaw sandbox reaches this host as host.openshell.internal (a Docker bridge address).
 # Loopback gets everything; the bridge only gets the endpoints the skill needs; anyone else
 # (e.g. the venue Wi-Fi when bound to 0.0.0.0) is refused, since /api/ask trusts the
 # organization/channel it is given.
 # Subnet of the openshell-docker network (docker network inspect openshell-docker).
 SANDBOX_NETWORK = ipaddress.ip_network(os.environ.get("MERIDIAN_SANDBOX_NETWORK", "172.18.0.0/16"))
-SANDBOX_PATHS = {"/api/visual-criteria"}
+SANDBOX_PATHS = {"/api/visual-criteria", "/api/deal-room/reset"}
 
 
 def request_allowed(remote_addr: str | None, path: str) -> bool:
@@ -1368,6 +1501,28 @@ if app:
             "last_action": "reset",
         })
         return jsonify({"ok": True, "voice": VOICE_MONITOR_STATE})
+
+    @app.route("/deal-room")
+    def deal_room_page() -> str:
+        return DEAL_ROOM_HTML
+
+    @app.route("/api/deal-room", methods=["GET"])
+    def deal_room_status():
+        return jsonify(deal_room_state())
+
+    @app.route("/api/deal-room/upload", methods=["POST"])
+    def deal_room_upload():
+        party = (request.form.get("party") or "").upper()
+        upload = request.files.get("file")
+        if party not in {"A", "B"} or not upload:
+            return jsonify({"error": "party (A|B) and file are required"}), 400
+        ctx = Context(actor_id=f"deal-room-{party}", organization=party, channel_type=f"{party}_DM", session_id="deal-room")
+        return jsonify(ingest_upload(party, upload.filename or "disclosure.json", upload.read(), ctx))
+
+    @app.route("/api/deal-room/reset", methods=["POST"])
+    def deal_room_reset():
+        ctx = Context(actor_id="moderator", organization="NEUTRAL", channel_type="JOINT_MEETING", session_id="deal-room")
+        return jsonify(reset_deal_room(ctx))
 
     @app.route("/api/health")
     def health():
@@ -1730,6 +1885,142 @@ async function sendChunk(blob){
     statusEl.textContent='Voice monitor error: '+err;
   }
 }
+</script></body></html>"""
+
+
+DEAL_ROOM_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meridian Deal Room</title>
+<style>
+:root{--bg:#101318;--panel:#171c24;--line:#29313f;--text:#e7edf5;--muted:#93a4b8;--a:#3b82f6;--b:#f59e0b;--ok:#22c55e;--bad:#ef4444}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text)}
+main{max-width:1180px;margin:0 auto;padding:28px 16px}
+header{display:flex;flex-wrap:wrap;gap:12px;align-items:center;justify-content:space-between;margin-bottom:18px}
+h1{font-size:24px;margin:0}
+.sub{color:var(--muted);margin:4px 0 0}
+.synthetic{display:inline-block;padding:2px 8px;border-radius:4px;background:#7f1d1d;color:#fecaca;font-size:12px;font-weight:700;margin-left:8px;vertical-align:middle}
+.room{font-variant-numeric:tabular-nums;color:var(--muted);font-size:13px}
+button{border-radius:6px;border:1px solid #334155;background:#212936;color:var(--text);padding:9px 14px;font-weight:600;cursor:pointer}
+button.primary{background:#2f6feb;border-color:#2f6feb}
+.grid{display:grid;grid-template-columns:repeat(auto-fit,minmax(320px,1fr));gap:16px}
+.card{border:1px solid var(--line);background:var(--panel);border-radius:10px;padding:16px;border-top:4px solid var(--c)}
+.card h2{font-size:17px;margin:0 0 2px}
+.role{color:var(--muted);font-size:13px;margin-bottom:12px}
+.drop{border:2px dashed #3a4456;border-radius:8px;padding:22px 12px;text-align:center;color:var(--muted);cursor:pointer;transition:border-color .15s,background .15s}
+.drop.over{border-color:var(--c);background:#1d2430}
+.drop input{display:none}
+.hint{font-size:12px;color:var(--muted);margin-top:8px}
+.hint code{color:#c7d2fe}
+.status{margin-top:12px;padding:10px 12px;border-radius:6px;background:#0d1117;border:1px solid var(--line);font-size:14px;min-height:42px}
+.status.ok{border-color:#166534}.status.bad{border-color:#7f1d1d}
+.badge{display:inline-block;padding:1px 8px;border-radius:999px;font-size:12px;font-weight:700}
+.badge.ok{background:#14532d;color:#bbf7d0}.badge.bad{background:#7f1d1d;color:#fecaca}
+.mono{font-family:ui-monospace,SFMono-Regular,Menlo,monospace;font-size:12px;color:var(--muted);word-break:break-all}
+ul.pkg{list-style:none;margin:10px 0 0;padding:0;font-size:13px}
+ul.pkg li{display:flex;justify-content:space-between;gap:8px;padding:4px 0;border-bottom:1px solid #222a36}
+ul.pkg li span:last-child{color:var(--muted);font-size:12px}
+.clean{margin-top:16px}
+.clean h2{font-size:17px;margin:0 0 8px}
+.clean ul{margin:8px 0 0;padding-left:18px}
+.steps{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+.step{padding:4px 10px;border-radius:999px;background:#212936;color:var(--muted);font-size:12px}
+.step.done{background:#14532d;color:#bbf7d0}
+</style>
+</head>
+<body><main>
+<header>
+  <div>
+    <h1>Meridian Deal Room <span class="synthetic">SYNTHETIC DEMO DATA</span></h1>
+    <p class="sub">HarborStone Financial Group (buyer) × QuantaShield AI (target) — Meridian is the neutral party.</p>
+    <div class="room" id="room">No deal room open.</div>
+  </div>
+  <button class="primary" onclick="resetRoom()">New deal room</button>
+</header>
+
+<div class="grid">
+  <section class="card" style="--c:var(--a)" id="card-A">
+    <h2>HarborStone Financial Group</h2>
+    <div class="role">Company A · buyer</div>
+    <label class="drop" id="drop-A">Drop or choose your signed disclosure (.json)<input type="file" accept=".json,application/json" onchange="upload('A', this.files[0])"></label>
+    <div class="hint">Demo file: <code>signed_inputs/buyer_reliability_authorized.json</code></div>
+    <div class="status" id="status-A">Waiting for upload.</div>
+    <ul class="pkg" id="pkg-A"></ul>
+  </section>
+  <section class="card" style="--c:var(--b)" id="card-B">
+    <h2>QuantaShield AI</h2>
+    <div class="role">Company B · target</div>
+    <label class="drop" id="drop-B">Drop or choose your signed disclosure (.json)<input type="file" accept=".json,application/json" onchange="upload('B', this.files[0])"></label>
+    <div class="hint">Demo file: <code>signed_inputs/startup_commercial_authorized.json</code> · tampered: <code>ATTACK_tampered_startup_metrics.json</code></div>
+    <div class="status" id="status-B">Waiting for upload.</div>
+    <ul class="pkg" id="pkg-B"></ul>
+  </section>
+</div>
+
+<section class="card clean" style="--c:#64748b">
+  <h2>Clean room</h2>
+  <div class="steps"><span class="step" id="st-A">HarborStone verified</span><span class="step" id="st-B">QuantaShield verified</span><span class="step" id="st-run">Recompute</span><span class="step" id="st-out">Joint-approved outputs</span></div>
+  <div id="clean" class="hint" style="font-size:14px">Runs automatically once both parties have a verified disclosure.</div>
+</section>
+</main>
+<script>
+const NAMES={A:'HarborStone',B:'QuantaShield'};
+function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+function setStatus(p,ok,html){const el=document.getElementById('status-'+p);el.className='status '+(ok===null?'':ok?'ok':'bad');el.innerHTML=html}
+function renderPkg(p,pkg){document.getElementById('pkg-'+p).innerHTML=(pkg||[]).map(f=>'<li><span>'+esc(f.file)+'</span><span>'+esc(f.classification)+'</span></li>').join('')}
+function renderSig(sig){return '<div class="mono">issuer '+esc(sig.issuer)+' · sha256 '+esc(sig.payload_sha256.slice(0,16))+'…</div>'}
+
+async function upload(p,file){
+  if(!file) return;
+  setStatus(p,null,'Verifying <b>'+esc(file.name)+'</b> …');
+  const form=new FormData(); form.append('party',p); form.append('file',file);
+  const r=await (await fetch('/api/deal-room/upload',{method:'POST',body:form})).json();
+  if(r.decision==='ALLOW'){
+    setStatus(p,true,'<span class="badge ok">VALID</span> Ed25519 signature verified for <b>'+esc(file.name)+'</b>'+renderSig(r.signature)+'<div class="hint">Package registered: '+r.package.length+' private files — never shown to the other side.</div>');
+    renderPkg(p,r.package);
+  }else{
+    setStatus(p,false,'<span class="badge bad">'+esc(r.reason_code==='DENY_INVALID_SIGNATURE'?'INVALID':'REJECTED')+'</span> '+esc(r.answer)+(r.signature?renderSig(r.signature):''));
+  }
+  load();
+}
+
+async function resetRoom(){
+  await fetch('/api/deal-room/reset',{method:'POST'});
+  ['A','B'].forEach(p=>{setStatus(p,null,'Waiting for upload.');renderPkg(p,[])});
+  load();
+}
+
+let lastRoom=null;
+async function load(){
+  const s=await (await fetch('/api/deal-room')).json();
+  document.getElementById('room').textContent=s.room_id?('Deal room '+s.room_id+' · opened '+new Date(s.opened_at).toLocaleTimeString()):'No deal room open.';
+  if(lastRoom && s.room_id!==lastRoom){['A','B'].forEach(p=>{setStatus(p,null,'Waiting for upload.');renderPkg(p,[])})}
+  lastRoom=s.room_id;
+  ['A','B'].forEach(p=>{
+    const v=s.parties&&s.parties[p];
+    document.getElementById('st-'+p).className='step'+(v?' done':'');
+    if(v && document.getElementById('pkg-'+p).children.length===0){
+      setStatus(p,true,'<span class="badge ok">VALID</span> '+esc(v.disclosure)+renderSig(v.signature));renderPkg(p,v.package);
+    }
+  });
+  const c=s.clean_room;
+  document.getElementById('st-run').className='step'+(c?' done':'');
+  document.getElementById('st-out').className='step'+(c?' done':'');
+  document.getElementById('clean').innerHTML=c
+    ? '<b>Clean room complete.</b> Only approved aggregates leave; raw records stay with their owner.<ul>'+c.highlights.map(h=>'<li>'+esc(h)+'</li>').join('')+'</ul><div class="hint">Outputs: '+c.outputs.map(esc).join(', ')+' · calculation receipt '+esc(c.receipt)+'</div>'
+    : 'Runs automatically once both parties have a verified disclosure.';
+}
+
+['A','B'].forEach(p=>{
+  const d=document.getElementById('drop-'+p);
+  d.addEventListener('dragover',e=>{e.preventDefault();d.classList.add('over')});
+  d.addEventListener('dragleave',()=>d.classList.remove('over'));
+  d.addEventListener('drop',e=>{e.preventDefault();d.classList.remove('over');upload(p,e.dataTransfer.files[0])});
+});
+load(); setInterval(load,2000);
 </script></body></html>"""
 
 

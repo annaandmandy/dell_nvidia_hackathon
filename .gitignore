@@ -7,3 +7,5 @@ logs/
 data/roles.json
 data/meeting/
 data/meridian/tts/
+data/meridian/deal_room/
+data/meridian/audit-*.jsonl

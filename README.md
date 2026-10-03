@@ -65,6 +65,23 @@ In a shared channel, mention the bot:
 
 In a DM, message the bot directly.
 
+### Deal room (demo opening)
+
+```bash
+python app.py        # then open http://127.0.0.1:5050/deal-room
+```
+
+`New deal room` (or `@MergeOps start a new deal room` in Slack) clears uploads, archives the
+audit trail and resets the meeting monitors. Each party then uploads one signed disclosure:
+
+- HarborStone: `meridian_finance_ai_demo_bundle/signed_inputs/buyer_reliability_authorized.json`
+- QuantaShield: `meridian_finance_ai_demo_bundle/signed_inputs/startup_commercial_authorized.json`
+- Tamper demo: `ATTACK_tampered_startup_metrics.json` (ARR 11.8 → 15.8) is rejected as INVALID
+
+Uploads are Ed25519-verified against the registered issuer key, and a party can only submit
+disclosures it issued. The rest of each package is registered from local disk. When both sides
+are verified the clean room runs automatically; every step is posted to Slack and audited.
+
 ### Continuous voice meeting monitor
 
 Run the local helper:

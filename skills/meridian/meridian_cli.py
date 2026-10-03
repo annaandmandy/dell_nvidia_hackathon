@@ -30,6 +30,16 @@ from meridian_format import format_response  # noqa: E402
 HOST_API = os.environ.get("MERIDIAN_HOST_API", "http://host.openshell.internal:5050")
 
 
+NEW_ROOM_PHRASES = ("new deal room", "new demo", "start a new deal", "reset the demo", "open a deal room")
+
+
+def host_post(path: str, body: dict | None = None) -> dict:
+    req = urllib.request.Request(f"{HOST_API}{path}", data=json.dumps(body or {}).encode(),
+                                 headers={"Content-Type": "application/json"}, method="POST")
+    with urllib.request.urlopen(req, timeout=15) as resp:
+        return json.loads(resp.read())
+
+
 def host_criteria(text: str | None = None) -> list[dict]:
     data = None if text is None else json.dumps({"text": text}).encode()
     req = urllib.request.Request(f"{HOST_API}/api/visual-criteria", data=data,
@@ -60,6 +70,12 @@ def main() -> None:
     args = p.parse_args()
 
     question = " ".join(args.question)
+    if any(p in question.lower() for p in NEW_ROOM_PHRASES):
+        room = host_post("/api/deal-room/reset")
+        print(f"*Meridian* — `ALLOW` / `DEAL_ROOM_OPENED`\nNew deal room `{room['room_id']}` is open. "
+              "Each party: submit your signed disclosure in the deal room page; I will verify it and "
+              "run the clean room once both sides are in.")
+        return
     if is_visual_criteria_command(question):
         print(format_criteria_response(host_criteria(question)))
         return
