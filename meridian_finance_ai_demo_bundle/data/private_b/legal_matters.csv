@@ -1,0 +1,3 @@
+matter_id,type,description,amount_claimed_usd_m,status,risk
+QS-LEGAL-01,former contractor demand,claim regarding inventorship and ownership contribution to QS-102,0.25,demand letter; no filed litigation,high
+QS-LEGAL-02,marketing substantiation,website states up to 40% loss reduction based on two pilots,0.0,claim requires narrower wording and support file,medium

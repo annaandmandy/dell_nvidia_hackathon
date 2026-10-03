@@ -1,0 +1,6 @@
+dataset_id,source,contains_personal_data,contract_allows_training,used_in_training,volume_share_pct,risk,required_action
+DS-001,customer FI-001 pilot documents,yes,no,yes,0.03,critical,"remove, retrain affected adapter, validate deletion"
+DS-002,customer service-improvement pool,yes,yes,yes,0.34,medium,"confirm notices, retention and de-identification"
+DS-003,licensed credit bureau development set,yes,yes,yes,0.28,medium,obtain change-of-control consent
+DS-004,public SEC filings,limited,public source review required,yes,0.15,low-medium,retain provenance and usage review
+DS-005,synthetic financial documents,no,yes,yes,0.2,low,retain generation records

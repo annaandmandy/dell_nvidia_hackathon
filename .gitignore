@@ -1,5 +1,8 @@
+__pycache__/
+*.pyc
 .venv/
 .env
-.venv
-data/
+data/meridian/audit.jsonl
 logs/
+data/roles.json
+data/meeting/

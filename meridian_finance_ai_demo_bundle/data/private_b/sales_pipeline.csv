@@ -1,0 +1,6 @@
+opportunity_token,segment,stage,potential_arr_usd_m,probability,expected_close
+OPP-101,regional bank,security review,2.2,0.65,2027-01-31
+OPP-102,payments provider,paid pilot,1.8,0.7,2026-12-31
+OPP-103,consumer lender,commercial proposal,1.5,0.45,2027-03-31
+OPP-104,credit union network,technical validation,2.8,0.3,2027-06-30
+OPP-105,mortgage lender,discovery,1.4,0.2,2027-07-31

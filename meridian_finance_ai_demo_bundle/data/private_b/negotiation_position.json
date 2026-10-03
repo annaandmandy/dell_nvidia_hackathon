@@ -1,0 +1,19 @@
+{
+  "classification": "B_PRIVATE",
+  "issuer": "QuantaShield AI",
+  "key_concerns": [
+    "earnout control by buyer after integration",
+    "buyer acquisition integration record",
+    "regulatory remediation affecting product roadmap",
+    "loss of model independence and customer trust"
+  ],
+  "minimum_acceptable_headline_ev_usd_m": 95.0,
+  "minimum_cash_at_close_usd_m": 80.0,
+  "requested_headline_ev_usd_m": 115.0,
+  "required_protections": [
+    "parent guarantee for earnout",
+    "audit rights over earnout metrics",
+    "acceleration if buyer sunsets product",
+    "funded employee retention pool outside purchase price"
+  ]
+}

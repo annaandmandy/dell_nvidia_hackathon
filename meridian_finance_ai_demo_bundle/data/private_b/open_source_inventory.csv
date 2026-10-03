@@ -1,0 +1,5 @@
+component,license,use,distributed_or_networked,source_available,risk,required_action
+PyTorch,BSD-3-Clause,model training and inference,yes,yes,low,retain notices
+XGBoost,Apache-2.0,baseline models,no,yes,low,retain notice and patent terms
+vector-core-agpl,AGPL-3.0,customer-accessible evaluation service,networked,no corresponding source offer,high,replace or obtain commercial license before close
+DocumentParse SDK,commercial,document extraction,yes,n.a.,medium,obtain change-of-control consent

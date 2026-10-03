@@ -1,0 +1,3 @@
+matter_id,authority,topic,severity,status,target_date,transaction_blocking
+HFG-REG-01,State lending regulator,Complaint-handling timeliness,medium,remediation in progress,2027-03-31,no
+HFG-REG-02,Independent assessor,2024 customer data incident follow-up,medium,remediated; monitoring open,2026-12-31,no

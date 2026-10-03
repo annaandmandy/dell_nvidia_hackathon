@@ -1,0 +1,35 @@
+{
+  "approved_at": "2026-10-03T13:34:00-04:00",
+  "buyer_reliability": {
+    "cash_and_committed_liquidity_usd_m": 375.0,
+    "cash_required_at_close_and_escrow_usd_m": 87.0,
+    "classification": "JOINT_APPROVED",
+    "conclusion": "Financeable with contractual protections",
+    "covenant_limit_x": 4.0,
+    "current_net_leverage_x": 1.65,
+    "funding_coverage_x": 4.3,
+    "positive_evidence": [
+      "three years of positive free cash flow",
+      "committed acquisition financing",
+      "no missed debt payments",
+      "pro forma covenant headroom"
+    ],
+    "pro_forma_net_leverage_x": 2.78,
+    "required_protections": [
+      "funding certificate at signing and close",
+      "parent guarantee for earnout",
+      "seller audit rights",
+      "product-sunset acceleration",
+      "defined operating covenants during earnout"
+    ],
+    "risks": [
+      "two prior integrations exceeded budget",
+      "one prior founder-retention result was 71%",
+      "open complaint-management remediation",
+      "earnout metrics would be controlled by buyer after close"
+    ]
+  },
+  "classification": "JOINT_APPROVED",
+  "issuer": "HarborStone Financial Group",
+  "schema_version": "2.0"
+}

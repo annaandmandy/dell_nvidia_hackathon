@@ -1,0 +1,17 @@
+{
+  "algorithm": "finance-ai-ma-analysis-v2",
+  "calculation_id": "MERIDIAN-FINAI-001",
+  "generated_at": "2026-10-03T13:40:00-04:00",
+  "input_hashes": {
+    "buyer_reliability_authorized.json": "86a29500e9ef8466a5c990c43b629a1326b1f8513d32989d6df44db6733764c0",
+    "startup_commercial_authorized.json": "fdf11b326dbf6f21c4f85ce431e463e93189405aa0380faeaf1254ac24a943f2",
+    "startup_ip_authorized.json": "67b64666feeaa9af669a4daae42b593d433097641d227216114eac7fad800dc0",
+    "synergy_assumptions.csv": "9da07a486014a8e80c76904409b34cc7715ed6bba965546fe4fa0ad2745aaeba"
+  },
+  "output_hashes": {
+    "buyer_reliability_summary.json": "457c5faf7a6d360312b162f81d009965a883a0c1c6eaacbb36f7cd3307493b5a",
+    "commercial_summary.json": "2d4bee1d9892f84292b09e04414da1324ac299038883da541ac8e9284a2798a0",
+    "ip_legal_summary.json": "363370333e9e91b6446769ff74c7fd451c8e86defe4e38aa9939e60d9d811fed",
+    "valuation_summary.json": "9cc9859bd9b33e36003f35e435bd122818543107c86261241060684fe8d8804b"
+  }
+}

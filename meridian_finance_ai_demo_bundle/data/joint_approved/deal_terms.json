@@ -1,0 +1,24 @@
+{
+  "buyer": "HarborStone Financial Group",
+  "cash_to_sellers_at_close_usd_m": 82.0,
+  "closing_conditions": [
+    "QS-102 assignment",
+    "restricted-data remediation",
+    "AGPL remediation",
+    "three customer consents",
+    "buyer funding certificate"
+  ],
+  "earnout_metrics": [
+    "2027 ARR",
+    "gross retention",
+    "signed production conversions from named pilots"
+  ],
+  "employee_retention_pool_outside_purchase_price_usd_m": 5.0,
+  "ip_compliance_escrow_usd_m": 5.0,
+  "neutral_headline_ev_usd_m": 100.0,
+  "performance_earnout_usd_m": 13.0,
+  "seller": "QuantaShield AI shareholders",
+  "structure": "100% acquisition on a cash-free, debt-free enterprise-value basis",
+  "synthetic": true,
+  "transaction": "HarborStone Financial Group acquisition of QuantaShield AI"
+}

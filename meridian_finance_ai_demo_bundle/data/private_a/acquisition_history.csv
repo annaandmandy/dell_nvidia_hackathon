@@ -1,0 +1,3 @@
+target,close_year,purchase_price_usd_m,integration_budget_usd_m,integration_actual_usd_m,milestone_delay_months,founder_retention_24m_pct,status
+DataLedger,2022,60.0,12.0,16.0,2,88,commercial targets met
+SecurePay Operations,2024,45.0,8.0,11.0,6,71,product migration delayed

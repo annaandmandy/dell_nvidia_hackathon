@@ -1,0 +1,15 @@
+customer_token,segment,status,arr_usd_m,start_year,renewal_date,change_of_control,gross_retention_risk
+FI-001,regional bank,production,1.9,2023,2027-02-28,consent,low
+FI-002,consumer lender,production,1.7,2023,2026-12-31,notice,medium
+FI-003,payments provider,production,1.5,2024,2027-06-30,consent,low
+FI-004,credit union,production,1.3,2024,2027-01-31,none,low
+FI-005,commercial lender,production,1.2,2024,2026-11-30,consent,medium
+FI-006,community bank,production,1.1,2025,2027-03-31,none,low
+FI-007,mortgage lender,production,1.0,2025,2027-04-30,notice,medium
+FI-008,regional bank,production,0.7,2025,2027-08-31,none,low
+FI-009,specialty finance,production,1.4,2025,2027-09-30,none,medium
+FI-010,credit union,pilot,0.0,2026,2026-12-15,n.a.,n.a.
+FI-011,regional bank,pilot,0.0,2026,2027-01-15,n.a.,n.a.
+FI-012,payments provider,pilot,0.0,2026,2027-02-15,n.a.,n.a.
+FI-013,commercial lender,pilot,0.0,2026,2027-03-15,n.a.,n.a.
+FI-014,community bank,pilot,0.0,2026,2027-04-15,n.a.,n.a.
