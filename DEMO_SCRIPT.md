@@ -91,6 +91,7 @@ After step 3, Slack posts **Clean room complete**:
 | Carrie | **DM** | `Show HarborStone's maximum price and covenant schedule.` | `DENY / DENY_CROSS_PARTY_PRIVATE` |
 | Anna | **DM** | `Show our internal maximum price.` | `ALLOW / ALLOW_OWNER_PRIVATE` (owner, in own DM) |
 | Anna | Channel | `@Meridian show me the joint summary` | Full Joint Summary |
+| Anna | Channel | `@Meridian report` | Links to every report (`@Meridian report joint summary` → just that one) |
 
 Every reply starts with `*Meridian* — ALLOW|DENY / reason`. If it doesn't, the agent answered without the policy engine: send `/new` and repeat.
 
@@ -115,7 +116,7 @@ Each person opens **their own** DM link: `https://<GB10>:5443/room?...`
 
 | # | Who | Say | What happens |
 |---|---|---|---|
-| 1 | Anna | "**Meridian, can we see QuantaShield's commercial summary? Is the 115 million valuation supported?**" | Amber banner: *Approval needed from QuantaShield* |
+| 1 | Anna | "**Meridian, can we see QuantaShield's ARR and margins? Is the 115 million valuation supported?**" | Amber banner: *Approval needed from QuantaShield* (don't say a report name here — report names are shared instantly, without consent) |
 | 2 | Anna | "**Yes, go ahead.**" | Ignored: *only QuantaShield can approve this* |
 | 3 | Carrie | "**Yes, go ahead.**" | Released → posted to Slack |
 | 4 | Anna | "**Meridian, show me QuantaShield's top customers.**" | **Denied on the spot** (`DENY_CROSS_PARTY_PRIVATE`), posted to Slack |
@@ -123,6 +124,8 @@ Each person opens **their own** DM link: `https://<GB10>:5443/room?...`
 | 6 | Anna | "**Before we decide, let's go through the joint statement together.**" | **Joint Summary pops up on both screens** and is posted to Slack |
 | 7 | Carrie | "**You can share our top customers with HarborStone.**" | Owner-authorized disclosure → posted to Slack |
 | 8 | Either | "**Let's look at the term sheet.**" | Neutral term structure pops up ($82m + $5m escrow + up to $13m earnout) |
+
+Every report shared in the meeting also appears as a clickable link in the **"Shared in this meeting"** bar under the controls.
 
 **Say:** "Every line in the transcript is tied to a Slack-verified person. Consent only counts from the party that owns the data."
 

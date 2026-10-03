@@ -31,6 +31,7 @@ HOST_API = os.environ.get("MERIDIAN_HOST_API", "http://host.openshell.internal:5
 
 
 NEW_ROOM_PHRASES = ("new deal", "start a new deal", "new demo", "reset the demo", "open a deal room")
+REPORT_PHRASES = ("report", "reports", "show reports", "show the reports", "list reports", "report links", "links")
 MEETING_PHRASES = ("new meeting", "start meeting", "start the meeting", "start a meeting", "open the meeting", "open a meeting")
 
 
@@ -82,6 +83,11 @@ def main() -> None:
     if is_command(question, NEW_ROOM_PHRASES):
         room = host_post("/api/deal-room/reset", {"announce": False, "actor_id": args.sender})
         print(f"*Meridian* — `ALLOW` / `DEAL_ROOM_OPENED`\n{room['announcement']}")
+        return
+    if is_command(question, REPORT_PHRASES):
+        links = host_post("/api/report-links", {"text": question})["links"]
+        lines = [f"• <{x['url']}|{x['title']}> — {x['blurb']}" for x in links]
+        print("*Meridian* — `ALLOW` / `REPORT_LINKS`\nJoint-approved reports (open on the deal network):\n" + "\n".join(lines))
         return
     if is_command(question, MEETING_PHRASES):
         room = host_post("/api/room/start", {"announce": False, "actor_id": args.sender})

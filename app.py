@@ -1760,6 +1760,7 @@ def room_speech(person: dict[str, str], text: str) -> dict[str, Any]:
         audit_decision(ctx, "ALLOW", "REPORT_SHARED_IN_MEETING", tool="meeting_room", report=rid)
         MEETING_ROOM["shared"] = {"report_id": rid, "title": title, "by": person["name"],
                                   "t": datetime.now(timezone.utc).isoformat()}
+        MEETING_ROOM.setdefault("shared_history", []).append(MEETING_ROOM["shared"])
         room_event("shared", f"{speaker} mentioned the {title} — shared on screen and in Slack",
                    decision="ALLOW", reason_code="ALLOW_JOINT_APPROVED", report_id=rid)
         return {"action": "report_shared", "report_id": rid}
@@ -1968,6 +1969,7 @@ def room_state(me: dict[str, str] | None) -> dict[str, Any]:
         "pending": pending and {k: pending[k] for k in ("request", "by_name", "owner")},
         "criteria": load_visual_criteria(), "ended": MEETING_ROOM.get("ended"),
         "shared": MEETING_ROOM.get("shared"),
+        "shared_history": MEETING_ROOM.get("shared_history", []),
     }
 
 
@@ -2130,7 +2132,8 @@ def render_report_html(rid: str, report: dict[str, Any]) -> str:
 # organization/channel it is given.
 # Subnet of the openshell-docker network (docker network inspect openshell-docker).
 SANDBOX_NETWORK = ipaddress.ip_network(os.environ.get("MERIDIAN_SANDBOX_NETWORK", "172.18.0.0/16"))
-SANDBOX_PATHS = {"/api/visual-criteria", "/api/deal-room/reset", "/api/owner-disclosure", "/api/room/start"}
+SANDBOX_PATHS = {"/api/visual-criteria", "/api/deal-room/reset", "/api/owner-disclosure", "/api/room/start",
+                 "/api/report-links"}
 
 
 # Laptops on the LAN (clicking the Slack link) may only use the deal room, and only with the
@@ -2384,6 +2387,15 @@ if app:
         audit_decision(Context(actor_id="report-link", organization="NEUTRAL", channel_type="JOINT_MEETING",
                                session_id="report"), "ALLOW", "REPORT_VIEWED", report=rid)
         return render_report_html(rid, report)
+
+    @app.route("/api/report-links", methods=["POST"])
+    def report_links():
+        body = request.get_json(silent=True) or {}
+        wanted = report_mention(str(body.get("text", "")))
+        rids = [wanted] if wanted else [r for r in REPORTS if r != "meeting" or
+                                        (DATA_DIR / "meetings" / "latest_report.json").exists()]
+        return jsonify({"links": [{"id": r, "title": REPORTS[r]["title"], "blurb": REPORTS[r]["blurb"],
+                                   "url": report_url(r)} for r in rids]})
 
     @app.route("/api/room/start", methods=["POST"])
     def room_start():
@@ -3453,6 +3465,11 @@ body{margin:0;background:var(--page);color:var(--text);font:15px/1.45 Calibri,Ca
 .btn:disabled{opacity:.5;cursor:default}
 .btn svg{width:18px;height:18px}
 .netstatus{font-size:13px;color:var(--muted);text-align:center}
+.docbar{display:flex;flex-wrap:wrap;align-items:center;gap:8px;padding:8px 12px;background:var(--card);border:1px solid var(--line);border-radius:10px;font-size:14px}
+.docbar .lbl{color:var(--muted);font-weight:700;font-size:12px;text-transform:uppercase;letter-spacing:.05em;margin-right:4px}
+.docbar a{display:inline-flex;align-items:center;gap:6px;padding:5px 10px;border-radius:999px;background:var(--brand-soft);color:var(--brand);font-weight:700;text-decoration:none;border:1px solid #c9d6e8}
+.docbar a:hover{background:#dbe5f2}
+.docbar a span{font-weight:400;color:var(--muted);font-size:12px}
 .side{display:flex;flex-direction:column;gap:12px;min-height:0}
 .side .grow{flex:1;min-height:0;display:flex;flex-direction:column}
 .side .grow .feed{flex:1;max-height:none}
@@ -3512,6 +3529,7 @@ body{margin:0;background:var(--page);color:var(--text);font:15px/1.45 Calibri,Ca
       <button class="btn" id="verifyBtn" onclick="toggleVerify()"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2"><path d="M9 12l2 2 4-4"/><circle cx="12" cy="12" r="9"/></svg><span>Verify my assets: off</span></button>
       <button class="btn end" onclick="endMeeting()">End meeting</button>
     </div>
+    <div class="docbar" id="docbar" hidden><span class="lbl">Shared in this meeting</span><span id="doclinks"></span></div>
     <div class="netstatus" id="netStatus"></div>
     <div class="report" id="report" hidden></div>
   </section>
@@ -3669,6 +3687,10 @@ function render(s){
     lastShared=sh.t; $('viewerTitle').textContent=sh.title+' — shared by '+sh.by;
     $('viewerFrame').src='/report/'+encodeURIComponent(sh.report_id)+'?t='+encodeURIComponent(T); $('viewer').hidden=false;
   }
+  const hist=s.shared_history||[];
+  $('docbar').hidden=!hist.length;
+  const seen={};
+  $('doclinks').innerHTML=hist.slice().reverse().filter(h=>!seen[h.report_id]&&(seen[h.report_id]=1)).map(h=>'<a href="/report/'+encodeURIComponent(h.report_id)+'?t='+encodeURIComponent(T)+'" target="_blank" rel="noopener">'+esc(h.title)+' <span>· '+esc(h.by)+' · '+esc((h.t||'').slice(11,16))+'</span> ↗</a>').join(' ');
   const pend=s.pending;
   $('pending').hidden=!pend;
   if(pend) $('pending').innerHTML='<b>Approval needed from '+esc(COMPANY[pend.owner])+'.</b> '+esc(pend.by_name)+' asked: “'+esc(pend.request)+'” — the owner says “yes, go ahead” to release it.';

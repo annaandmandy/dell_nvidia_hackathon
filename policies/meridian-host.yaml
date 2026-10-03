@@ -1,5 +1,5 @@
 # Lets the Meridian skill (python3 in the sandbox) read/update the visual-audit criteria held by
-# app.py on the host (:5050) open a new deal room, publish an owner-authorized disclosure, and start a meeting. Nothing else on the host is reachable through this preset, and
+# app.py on the host (:5050) open a new deal room, publish an owner-authorized disclosure, start a meeting, and fetch report links. Nothing else on the host is reachable through this preset, and
 # app.py additionally refuses any other path from the sandbox network.
 preset:
   name: meridian-host
@@ -22,6 +22,7 @@ network_policies:
           - allow: { method: POST, path: "/api/deal-room/reset" }
           - allow: { method: POST, path: "/api/owner-disclosure" }
           - allow: { method: POST, path: "/api/room/start" }
+          - allow: { method: POST, path: "/api/report-links" }
     binaries:
       - { path: /usr/bin/python3 }
       - { path: /usr/bin/python3.13 }
