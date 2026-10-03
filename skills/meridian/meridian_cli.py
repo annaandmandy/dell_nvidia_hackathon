@@ -85,6 +85,11 @@ def main() -> None:
     if args.camera:
         ctx = Context(actor_id=args.sender, organization="NEUTRAL", channel_type="CAMERA", session_id="openclaw")
     result = handle_request(question, ctx)
+    if result["reason_code"] == "ALLOW_OWNER_AUTHORIZED_DISCLOSURE":
+        # The owner released it here; the host re-checks identity and posts it to the joint channel.
+        published = host_post("/api/owner-disclosure", {"sender": args.sender, "dm": args.dm, "text": question})
+        result["answer"] += (" Posted to the joint channel for the other party." if published.get("ok")
+                             else " (Could not post to the joint channel.)")
     print(format_response(result))
     print(f"\n_context: org={ctx.organization} channel={ctx.channel_type}_")
 

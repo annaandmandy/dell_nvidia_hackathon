@@ -38,11 +38,12 @@ except ImportError:
         return False
 
 try:
-    from flask import Flask, jsonify, request
+    from flask import Flask, jsonify, request, send_file
 except ImportError:
     Flask = None
     jsonify = None
     request = None
+    send_file = None
 
 from ed25519_verify import public_key_from_pem, verify as ed25519_verify
 from meridian_format import format_response
@@ -90,6 +91,9 @@ VOICE_MONITOR_STATE: dict[str, Any] = {
     "chunk_count": 0,
     "pending_request_text": None,
     "last_action": None,
+    "transcript_segments": [],
+    "action_events": [],
+    "meeting_started_at": None,
 }
 
 app = Flask(__name__) if Flask else None
@@ -549,6 +553,93 @@ def camera(ctx: Context, prompt: str) -> dict[str, Any]:
     return agenda(ctx, prompt)
 
 
+# ── owner-authorized disclosure (from Carrie's branch): the owner explicitly releases its own
+# private resource to the other party. Joint presence never does this; only the owner's own words. ──
+
+AUTHORIZATION_PHRASES = ("you can show", "you can share", "you may show", "you may share", "we approve sharing",
+                         "i approve sharing", "share our", "show our", "send our", "release our")
+OWNER_DISCLOSABLE = {
+    "B": [("RAW_CUSTOMER_ARR", ("top customer", "customer file", "contract value", "customer concentration",
+                                "customer list", "customers")),
+          ("STARTUP_NEGOTIATION_POSITION", ("negotiation position", "negotiation memo", "minimum price",
+                                            "minimum acceptable"))],
+    "A": [("BUYER_ACQUISITION_STRATEGY", ("board memo", "walk-away", "walk away", "acquisition strategy",
+                                          "maximum price", "internal maximum")),
+          ("BUYER_DEBT_COVENANTS", ("covenant schedule", "debt covenant", "covenants"))],
+}
+
+
+def target_org_from_text(text: str) -> str | None:
+    t = text.lower()
+    if re.search(r"\b(to|with|for|show)\s+(company\s+a|harborstone|the buyer)\b", t) or re.search(r"\bshow\s+a\s+our\b", t):
+        return "A"
+    if re.search(r"\b(to|with|for|show)\s+(company\s+b|quantashield|the seller|the target)\b", t) or re.search(r"\bshow\s+b\s+our\b", t):
+        return "B"
+    return None
+
+
+def detect_owner_authorized_disclosure(text: str, ctx: Context) -> dict[str, Any] | None:
+    t = text.lower()
+    if ctx.organization not in OWNER_DISCLOSABLE or not any(p in t for p in AUTHORIZATION_PHRASES):
+        return None
+    target = target_org_from_text(text)
+    if not target or target == ctx.organization:
+        return None
+    for resource_id, phrases in OWNER_DISCLOSABLE[ctx.organization]:
+        if any(p in t for p in phrases):
+            return {"resource_id": resource_id, "target_org": target}
+    return None
+
+
+def owner_disclosure_lines(resource_id: str) -> list[str]:
+    if resource_id == "RAW_CUSTOMER_ARR":
+        rows = sorted((r for r in _csv("data/private_b/customer_arr.csv") if r["status"] == "production"),
+                      key=lambda r: -float(r["arr_usd_m"]))[:3]
+        return [f"{r['customer_token']} ({r['segment']}): ARR {m(float(r['arr_usd_m']))}, renewal {r['renewal_date']}, "
+                f"change of control: {r['change_of_control']}" for r in rows]
+    if resource_id == "BUYER_DEBT_COVENANTS":
+        return [f"{r['covenant']}: limit {r['limit']}, current {r['current']}, pro forma {r['pro_forma_close']} — {r['status']}"
+                for r in _csv("data/private_a/debt_covenants.csv")]
+    data = _json(RESOURCE_SOURCES[resource_id])
+    return [f"{k}: {v}" for k, v in data.items() if k not in {"classification", "issuer"}]
+
+
+def owner_authorized_disclosure(ctx: Context, disclosure: dict[str, Any]) -> dict[str, Any]:
+    resource_id, target = disclosure["resource_id"], disclosure["target_org"]
+    audit_decision(ctx, "ALLOW", "ALLOW_OWNER_AUTHORIZED_DISCLOSURE", resource_id=resource_id, target_org=target)
+    return {
+        "decision": "ALLOW",
+        "reason_code": "ALLOW_OWNER_AUTHORIZED_DISCLOSURE",
+        "answer": f"{PARTY[ctx.organization]} explicitly authorized releasing `{resource_id}` to {PARTY[target]}.",
+        "sections": [section("VERIFIED_FACT", f"{resource_id} — released by its owner", owner_disclosure_lines(resource_id))],
+        "disclosure": {"resource_id": resource_id, "owner_org": ctx.organization, "target_org": target,
+                       "authorized_by": ctx.actor_id},
+        "disclaimer": DISCLAIMER,
+    }
+
+
+def context_for_slack_user(sender: str, is_dm: bool) -> Context:
+    """Same mapping as the skill / slack_bot.infer_context, from the host's roles.json."""
+    roles = json.loads((ROOT / "data" / "roles.json").read_text())
+    company = roles["users"].get(sender, {}).get("company")
+    organization = roles["companies"].get(company, {}).get("org", "NEUTRAL")
+    channel_type = f"{organization}_DM" if is_dm and organization in ("A", "B") else "JOINT_SLACK"
+    return Context(actor_id=sender, organization=organization, channel_type=channel_type, session_id="openclaw")
+
+
+def publish_owner_disclosure(sender: str, is_dm: bool, text: str) -> dict[str, Any]:
+    """Host side of an owner release: re-derive identity and re-check before posting to the joint channel."""
+    ctx = context_for_slack_user(sender, is_dm)
+    disclosure = detect_owner_authorized_disclosure(text, ctx)
+    if not disclosure:
+        return {"ok": False, "error": "not an owner-authorized disclosure for this sender"}
+    result = owner_authorized_disclosure(ctx, disclosure)
+    header = (f":unlock: *Owner-authorized disclosure* — {PARTY[ctx.organization]} → {PARTY[disclosure['target_org']]}, "
+              f"authorized by <@{sender}>\n")
+    slack = post_to_slack(header + format_response(result))
+    return {"ok": bool(slack.get("ok")), "slack": slack}
+
+
 def handle_request(text: str, ctx: Context) -> dict[str, Any]:
     prompt = text.strip()
     t = prompt.lower()
@@ -560,6 +651,11 @@ def handle_request(text: str, ctx: Context) -> dict[str, Any]:
         return denied("DENY_INDIRECT_INJECTION", ctx, safety_event="INDIRECT_INJECTION")
     if _has(t, "keep the old signature", "use the modified", "use the tampered", "with the old signature"):
         return signature_check(ctx, prompt, use_tampered=True)
+
+    # Owner explicitly releasing its own private resource to the other party.
+    disclosure = detect_owner_authorized_disclosure(prompt, ctx)
+    if disclosure:
+        return owner_authorized_disclosure(ctx, disclosure)
 
     # 2. Inference attacks on aggregates.
     if _has(t, "every possible", "until one result changes", "each possible excluded"):
@@ -1113,10 +1209,107 @@ def transcribe_audio(audio_bytes: bytes, filename: str, mime_type: str) -> str:
     return (payload.get("text") or payload.get("transcript") or "").strip()
 
 
+def upload_meeting_files_to_slack(files: dict[str, Any]) -> dict[str, Any]:
+    if not (SLACK_BOT_TOKEN and SLACK_CHANNEL_ID):
+        return {"ok": False, "uploaded": [], "error": "slack_not_configured"}
+    try:
+        from slack_sdk import WebClient
+        client = WebClient(token=SLACK_BOT_TOKEN)
+        uploaded = []
+        for key, title in [("summary_path", "MergeOps meeting summary"), ("transcript_path", "MergeOps meeting transcription")]:
+            path = files.get(key)
+            if not path:
+                continue
+            response = client.files_upload_v2(
+                channel=SLACK_CHANNEL_ID,
+                file=path,
+                title=f"{title} — {Path(path).name}",
+                initial_comment=f"{title} generated at meeting end.",
+            )
+            uploaded.append({"file": Path(path).name, "ok": bool(response.get("ok"))})
+        return {"ok": all(item["ok"] for item in uploaded) if uploaded else False, "uploaded": uploaded, "error": None}
+    except Exception as exc:
+        return {"ok": False, "uploaded": [], "error": str(exc)}
+
+
+
+def write_meeting_outputs(criteria: list[dict[str, Any]], visual_complete: bool) -> dict[str, Any]:
+    out_dir = DATA_DIR / "meetings"
+    out_dir.mkdir(parents=True, exist_ok=True)
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    base = f"meeting_{stamp}"
+    transcript_path = out_dir / f"{base}_transcript.txt"
+    summary_path = out_dir / f"{base}_summary.md"
+
+    segments = VOICE_MONITOR_STATE.get("transcript_segments") or []
+    events = VOICE_MONITOR_STATE.get("action_events") or []
+    transcript_lines = []
+    for seg in segments:
+        transcript_lines.append(f"Speaker: {seg.get('text', '')}")
+    transcript_text = "\n".join(transcript_lines).strip() or "(No speech transcript captured.)"
+    transcript_path.write_text(transcript_text + "\n", encoding="utf-8")
+
+    documents_pulled = [
+        f"{e.get('decision')} / {e.get('reason_code')} — “{e.get('request')}”"
+        for e in events
+        if "pull_document" in str(e.get("action")) and e.get("decision")
+    ]
+    requests = [e for e in events if "request" in str(e.get("action"))]
+    approvals = [e for e in events if "consent" in str(e.get("action"))]
+
+    summary_lines = [
+        "# Meridian Meeting Summary",
+        "",
+        f"- Started: {VOICE_MONITOR_STATE.get('meeting_started_at') or 'unknown'}",
+        f"- Ended: {datetime.now(timezone.utc).isoformat()}",
+        f"- Voice chunks processed: {VOICE_MONITOR_STATE.get('chunk_count', 0)}",
+        f"- Visual frames processed: {VISUAL_MONITOR_STATE.get('frame_count', 0)}",
+        f"- Visual due diligence complete: {visual_complete}",
+        "",
+        "## Key Outcomes",
+    ]
+    if documents_pulled:
+        for outcome in documents_pulled:
+            summary_lines.append(f"- Voice approval detected; Meridian policy result: {outcome}")
+    else:
+        summary_lines.append("- No approved document pull was completed.")
+
+    if requests:
+        summary_lines += ["", "## Document Requests"]
+        for event in requests:
+            summary_lines.append(f"- Speaker segment {event.get('chunk')}: {event.get('text')}")
+
+    if approvals:
+        summary_lines += ["", "## Approval Signals"]
+        for event in approvals:
+            summary_lines.append(f"- Speaker segment {event.get('chunk')}: {event.get('text')}")
+
+    summary_lines += ["", "## On-Site Due Diligence"]
+    for item in criteria:
+        mark = "complete" if item.get("completed") else "open"
+        summary_lines.append(
+            f"- {item.get('object')}: {item.get('current_count', 0)}/{item.get('target_count')} ({mark})"
+            + (f" — {item.get('evidence')}" if item.get("evidence") else "")
+        )
+
+    summary_lines += ["", "## Transcript File", f"- `{transcript_path.name}`"]
+    summary_path.write_text("\n".join(summary_lines) + "\n", encoding="utf-8")
+
+    return {
+        "transcript_path": str(transcript_path),
+        "summary_path": str(summary_path),
+        "transcript_url": f"/media/meetings/{transcript_path.name}",
+        "summary_url": f"/media/meetings/{summary_path.name}",
+        "documents_pulled": documents_pulled,
+    }
+
+
+
 MEETING_CTX = Context(actor_id="voice-meeting", organization="NEUTRAL", channel_type="JOINT_MEETING", session_id="voice")
-REQUEST_WORDS = ("can i have", "can we have", "could i have", "could we have", "please send", "pull", "show", "share",
-                 "meridian")
-TOPIC_WORDS = ("financial", "commercial summary", "revenue", "ebitda", "arr", "valuation", "115", "patent", "ip ",
+REQUEST_WORDS = ("can i have", "can we have", "could i have", "could we have", "can i see", "can we see",
+                 "could i see", "could we see", "can i view", "can we view", "can i access", "can we access",
+                 "please send", "pull", "show", "share", "get", "meridian")
+TOPIC_WORDS = ("financial statement", "financial report", "financial summary", "financial", "commercial summary", "revenue", "ebitda", "arr", "valuation", "115", "patent", "ip ",
                "legal", "open-source", "open source", "fund", "earnout", "reliab", "term structure", "agenda",
                "customer", "maximum price", "minimum", "covenant", "memo", "verify", "signature")
 
@@ -1133,6 +1326,10 @@ def detect_consent(transcript: str) -> bool:
     t = re.sub(r"[^a-z0-9\s']", " ", transcript.lower())
     consent_phrases = (
         "yes",
+        "yeah",
+        "yep",
+        "ok",
+        "okay",
         "yes please",
         "yes you can",
         "sure",
@@ -1147,11 +1344,11 @@ def detect_consent(transcript: str) -> bool:
     return any(re.search(rf"\b{re.escape(phrase)}\b", t) for phrase in consent_phrases)
 
 
-def run_meeting_request(request_text: str) -> dict[str, Any]:
+def run_meeting_request(request_text: str) -> tuple[dict[str, Any], dict[str, Any]]:
     """Same policy engine as Slack: joint-approved material is posted, private material is denied."""
     result = handle_request(request_text, MEETING_CTX)
     header = "*Meridian Voice Monitor* — spoken request, voice consent detected\n"
-    return post_to_slack(header + format_response(result))
+    return post_to_slack(header + format_response(result)), result
 
 
 def process_voice_transcript(transcript: str) -> dict[str, Any]:
@@ -1160,16 +1357,24 @@ def process_voice_transcript(transcript: str) -> dict[str, Any]:
     if not clean:
         return {"action": "silence", "posted_to_slack": False}
 
+    VOICE_MONITOR_STATE.setdefault("transcript_segments", []).append({
+        "chunk": VOICE_MONITOR_STATE["chunk_count"],
+        "timestamp": datetime.now(timezone.utc).isoformat(),
+        "text": clean,
+    })
+
     requested = detect_document_request(clean)
     consent = detect_consent(clean)
     action = "transcribed"
     slack = {"ok": True, "via": "suppressed", "error": None}
+    outcome: dict[str, Any] | None = None
+    pending_before = VOICE_MONITOR_STATE.get("pending_request_text")
 
     if requested:
         VOICE_MONITOR_STATE["pending_request_text"] = requested
         if consent:
             action = "request_and_consent_detected_pull_document"
-            slack = run_meeting_request(requested)
+            slack, outcome = run_meeting_request(requested)
             VOICE_MONITOR_STATE["pending_request_text"] = None
         else:
             action = "request_detected"
@@ -1181,10 +1386,20 @@ def process_voice_transcript(transcript: str) -> dict[str, Any]:
 
     elif consent and VOICE_MONITOR_STATE.get("pending_request_text"):
         action = "consent_detected_pull_document"
-        slack = run_meeting_request(str(VOICE_MONITOR_STATE["pending_request_text"]))
+        slack, outcome = run_meeting_request(str(VOICE_MONITOR_STATE["pending_request_text"]))
         VOICE_MONITOR_STATE["pending_request_text"] = None
 
     VOICE_MONITOR_STATE["last_action"] = action
+    if action != "transcribed":
+        VOICE_MONITOR_STATE.setdefault("action_events", []).append({
+            "chunk": VOICE_MONITOR_STATE["chunk_count"],
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "action": action,
+            "text": clean,
+            "request": requested or pending_before,
+            "decision": outcome and outcome.get("decision"),
+            "reason_code": outcome and outcome.get("reason_code"),
+        })
     # Transcripts are redacted from the audit trail; only the action is recorded.
     audit({
         "decision": "ALLOW",
@@ -1331,7 +1546,8 @@ def reset_deal_room(ctx: Context, announce: bool = True) -> dict[str, Any]:
     if AUDIT_PATH.exists():
         AUDIT_PATH.rename(AUDIT_PATH.with_name(f"audit-{datetime.now():%Y%m%d-%H%M%S}.jsonl"))
     save_visual_criteria(load_visual_criteria(), reset_progress=True)
-    VOICE_MONITOR_STATE.update({"active": False, "chunk_count": 0, "pending_request_text": None, "last_action": "reset"})
+    VOICE_MONITOR_STATE.update({"active": False, "chunk_count": 0, "pending_request_text": None, "last_action": "reset",
+                                "transcript_segments": [], "action_events": [], "meeting_started_at": None})
     # Each registered person gets a personal link by Slack DM. Only that person can read their DM, so
     # holding the token proves the Slack identity (magic-link style); the token fixes the party.
     tokens = {secrets.token_urlsafe(12): person for person in deal_room_people()}
@@ -1403,7 +1619,7 @@ def deal_room_announcement(room_id: str, people: Any) -> str:
 # organization/channel it is given.
 # Subnet of the openshell-docker network (docker network inspect openshell-docker).
 SANDBOX_NETWORK = ipaddress.ip_network(os.environ.get("MERIDIAN_SANDBOX_NETWORK", "172.18.0.0/16"))
-SANDBOX_PATHS = {"/api/visual-criteria", "/api/deal-room/reset"}
+SANDBOX_PATHS = {"/api/visual-criteria", "/api/deal-room/reset", "/api/owner-disclosure"}
 
 
 # Laptops on the LAN (clicking the Slack link) may only use the deal room, and only with the
@@ -1432,6 +1648,14 @@ if app:
 
     @app.route("/")
     def index() -> str:
+        return MEETING_HTML
+
+    @app.route("/meeting")
+    def meeting_page() -> str:
+        return MEETING_HTML
+
+    @app.route("/console")
+    def console_page() -> str:
         return UI_HTML
 
     @app.route("/vision")
@@ -1524,6 +1748,16 @@ if app:
             criteria = parse_visual_criteria_text(body.get("text", ""))
         return jsonify({"criteria": criteria, "complete": criteria_complete(criteria), "finalized": None})
 
+    @app.route("/api/visual-criteria/reset", methods=["POST"])
+    def visual_criteria_reset():
+        criteria = save_visual_criteria(load_visual_criteria(), reset_progress=True)
+        VISUAL_MONITOR_STATE["last_signature"] = None
+        VISUAL_MONITOR_STATE["last_slack_at"] = None
+        VISUAL_MONITOR_STATE["frame_count"] = 0
+        VISUAL_MONITOR_STATE["finalized"] = None
+        audit({"decision": "ALLOW", "reason_code": "VISUAL_CRITERIA_RESET"})
+        return jsonify({"ok": True, "criteria": criteria, "complete": False, "finalized": None})
+
     @app.route("/api/visual-monitor/stop", methods=["POST"])
     def stop_visual_monitor():
         body = request.json or {}
@@ -1573,10 +1807,13 @@ if app:
     @app.route("/api/voice-reset", methods=["POST"])
     def voice_reset():
         VOICE_MONITOR_STATE.update({
-            "active": False,
+            "active": True,
             "chunk_count": 0,
             "pending_request_text": None,
             "last_action": "reset",
+            "transcript_segments": [],
+            "action_events": [],
+            "meeting_started_at": datetime.now(timezone.utc).isoformat(),
         })
         return jsonify({"ok": True, "voice": VOICE_MONITOR_STATE})
 
@@ -1605,12 +1842,65 @@ if app:
         ctx = Context(actor_id=actor, organization=party, channel_type=f"{party}_DM", session_id="deal-room")
         return jsonify(ingest_upload(party, upload.filename or "disclosure.json", upload.read(), ctx))
 
+    @app.route("/api/owner-disclosure", methods=["POST"])
+    def owner_disclosure():
+        body = request.get_json(silent=True) or {}
+        return jsonify(publish_owner_disclosure(str(body.get("sender", "")), bool(body.get("dm")), str(body.get("text", ""))))
+
     @app.route("/api/deal-room/reset", methods=["POST"])
     def deal_room_reset():
         body = request.get_json(silent=True) or {}
         ctx = Context(actor_id=body.get("actor_id") or "moderator", organization="NEUTRAL",
                       channel_type="JOINT_MEETING", session_id="deal-room")
         return jsonify(reset_deal_room(ctx, announce=body.get("announce", True)))
+
+    @app.route("/api/meeting-end", methods=["POST"])
+    def meeting_end():
+        VOICE_MONITOR_STATE["active"] = False
+        criteria = load_visual_criteria()
+        visual_complete = criteria_complete(criteria)
+        files = write_meeting_outputs(criteria, visual_complete)
+        file_upload = upload_meeting_files_to_slack(files)
+        text = (
+            "*Meridian Meeting Monitor ended*\n"
+            f"Voice chunks processed: `{VOICE_MONITOR_STATE.get('chunk_count', 0)}`\n"
+            f"Visual frames processed: `{VISUAL_MONITOR_STATE.get('frame_count', 0)}`\n"
+            f"Pending voice request: `{VOICE_MONITOR_STATE.get('pending_request_text') or 'none'}`\n"
+            f"Visual audit complete: `{visual_complete}`\n"
+            f"Documents pulled: `{len(files['documents_pulled'])}`\n"
+            f"Summary file: `{Path(files['summary_path']).name}`\n"
+            f"Transcript file: `{Path(files['transcript_path']).name}`\n"
+            f"Slack file upload: `{'ok' if file_upload.get('ok') else 'fallback'}`"
+        )
+        slack = post_to_slack(text)
+        audit({
+            "decision": "ALLOW",
+            "reason_code": "MEETING_MONITOR_END",
+            "voice_chunks": VOICE_MONITOR_STATE.get("chunk_count", 0),
+            "visual_frames": VISUAL_MONITOR_STATE.get("frame_count", 0),
+            "slack_ok": slack.get("ok"),
+        })
+        return jsonify({
+            "ok": True,
+            "slack": slack,
+            "files": files,
+            "file_upload": file_upload,
+            "voice": VOICE_MONITOR_STATE,
+            "visual": {
+                "frame_count": VISUAL_MONITOR_STATE.get("frame_count", 0),
+                "criteria": criteria,
+                "complete": visual_complete,
+            },
+        })
+
+    @app.route("/media/meetings/<name>")
+    def meeting_media(name: str):
+        path = DATA_DIR / "meetings" / name
+        if not path.exists() or path.suffix not in {".txt", ".md"}:
+            return jsonify({"error": "not found"}), 404
+        mimetype = "text/markdown" if path.suffix == ".md" else "text/plain"
+        return send_file(path, mimetype=mimetype, as_attachment=True)
+
 
     @app.route("/api/health")
     def health():
@@ -2134,6 +2424,310 @@ async function load(){
   d.addEventListener('drop',e=>{e.preventDefault();d.classList.remove('over');upload(p,e.dataTransfer.files[0])});
 });
 load(); setInterval(load,2000);
+</script></body></html>"""
+
+
+MEETING_HTML = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MergeOps Meeting Monitor</title>
+<style>
+*{box-sizing:border-box}
+body{margin:0;background:#f4f5f7;color:#172033;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif}
+main{max-width:1440px;margin:0 auto;padding:24px}
+h1{font-size:28px;line-height:1.1;margin:0;color:#111827}.sub{color:#5f6b7a;margin:7px 0 0;font-size:14px}
+.top{display:flex;align-items:flex-end;justify-content:space-between;gap:18px;margin-bottom:18px}
+.bar{display:flex;gap:10px;flex-wrap:wrap}.bar button{min-width:146px}
+button{border:1px solid #2563eb;background:#2563eb;color:white;padding:11px 14px;border-radius:8px;font-weight:700;cursor:pointer;box-shadow:0 1px 2px rgba(15,23,42,.08)}
+button:hover{background:#1d4ed8}button.danger{background:#dc2626;border-color:#dc2626}button.danger:hover{background:#b91c1c}
+.grid{display:grid;grid-template-columns:minmax(680px,2fr) minmax(360px,1fr);gap:18px;align-items:start}
+.panel{background:#fff;border:1px solid #d9e2ec;border-radius:10px;padding:16px;box-shadow:0 10px 28px rgba(31,41,55,.08)}
+.video-panel{padding:10px;background:#15171c;border-color:#15171c;box-shadow:0 14px 34px rgba(0,0,0,.18)}
+video,canvas{width:100%;background:#111827;border-radius:8px;aspect-ratio:16/9;min-height:620px;max-height:calc(100vh - 150px);object-fit:cover}
+canvas{display:none}
+.status{font-size:14px;color:#2563eb;margin:8px 0 16px;min-height:20px}
+.small{font-size:12px;color:#6b7280}
+.pill{display:inline-block;margin:8px 6px 0 0;padding:5px 9px;border-radius:999px;background:#232832;color:#dbeafe;font-size:12px;border:1px solid #343b49}
+.panel h2{font-size:16px;margin:0;color:#111827}
+.audit{display:grid;gap:8px;margin-bottom:12px}
+.audit-row{display:grid;grid-template-columns:1fr auto;gap:10px;align-items:center;border:1px solid #d7dee8;background:#f8fafc;border-radius:8px;padding:10px}
+.audit-row.done{border-color:#9bd7b5;background:#f0fbf5}.audit-row.missing{border-color:#f2d49b;background:#fffaf0}
+.audit-label{font-weight:700;color:#1f2937}.audit-evidence{font-size:12px;color:#64748b;margin-top:3px}
+.audit-count{font-variant-numeric:tabular-nums;color:#334155;font-size:12px;font-weight:700}
+.right-head{display:flex;align-items:center;justify-content:space-between;gap:10px;margin-bottom:10px}
+.right-head button{min-width:auto;padding:8px 10px}
+.transcript{min-height:240px;max-height:340px;overflow:auto;background:#fbfdff;border:1px solid #dbe4ef;border-radius:8px;padding:12px;margin-top:10px}
+.utterance{border-bottom:1px solid #e5edf5;padding:9px 0;line-height:1.45;color:#172033}.utterance:last-child{border-bottom:0}
+.chunk{font-size:12px;color:#64748b;margin-right:6px;font-weight:700}
+.files{display:flex;gap:10px;flex-wrap:wrap;margin-top:12px}.files a{color:#075985;text-decoration:none;border:1px solid #bae6fd;border-radius:8px;padding:8px 10px;background:#f0f9ff;font-weight:700}
+.event{font-size:12px;color:#475569;margin-top:8px;min-height:18px}
+.side{display:grid;gap:14px}
+@media(max-width:1040px){.top{display:block}.bar{margin-top:14px}.grid{grid-template-columns:1fr}video,canvas{min-height:360px}}
+</style>
+</head>
+<body><main>
+<div class="top">
+  <div>
+    <h1>MergeOps Meeting Monitor</h1>
+    <div class="sub">Continuous voice, visual due diligence, and Slack-ready meeting artifacts.</div>
+  </div>
+  <div class="bar">
+    <button onclick="startMeeting()">Start Meeting</button>
+    <button onclick="openDueDiligence()">On-Site Due Diligence</button>
+    <button class="danger" onclick="endMeeting()">End Meeting</button>
+  </div>
+</div>
+<div id="status" class="status">Stopped.</div>
+<div class="grid">
+<section class="panel video-panel">
+  <video id="video" autoplay playsinline muted></video>
+  <canvas id="canvas"></canvas>
+  <div class="small">
+    <span class="pill">voice latency: ~2s</span>
+    <span class="pill">visual scan: 4s</span>
+    <span class="pill">Slack on actions/final states</span>
+  </div>
+</section>
+<section class="side">
+<div class="panel">
+  <div class="right-head">
+    <h2>On-Site Due Diligence</h2>
+    <div>
+      <button onclick="resetDueDiligence()">Reset</button>
+      <button onclick="triggerDueDiligence()">Check now</button>
+    </div>
+  </div>
+  <div id="auditList" class="audit">
+    <div class="audit-row missing"><div><div class="audit-label">Physical audit loading...</div></div><div class="audit-count">--</div></div>
+  </div>
+  <div class="small">Physical checks run continuously after Start Meeting and update this panel.</div>
+</div>
+<div class="panel">
+  <h2>Live Transcription</h2>
+  <div id="transcript" class="transcript"><div class="small">Ready. Click Start Meeting.</div></div>
+  <div id="event" class="event"></div>
+  <div id="files" class="files"></div>
+</div>
+</section>
+</div>
+</main>
+<script>
+const video=document.getElementById('video');
+const canvas=document.getElementById('canvas');
+const statusEl=document.getElementById('status');
+const transcriptEl=document.getElementById('transcript');
+const eventEl=document.getElementById('event');
+const filesEl=document.getElementById('files');
+const auditList=document.getElementById('auditList');
+let meeting=false;
+let mediaStream=null;
+let audioStream=null;
+let recorder=null;
+let voiceTimer=null;
+let visualTimer=null;
+let voiceChunk=0;
+let visualFrame=0;
+let voiceInFlight=false;
+let visualInFlight=false;
+let lastVoice={};
+let lastVisual={};
+let transcriptLines=[];
+
+async function loadDueDiligence(){
+  try{
+    const res=await fetch('/api/visual-criteria');
+    const data=await res.json();
+    renderAudit(data.criteria||[], data.complete, data.finalized);
+  }catch(err){
+    auditList.innerHTML='<div class="audit-row missing"><div><div class="audit-label">Could not load audit checklist</div><div class="audit-evidence">'+err+'</div></div><div class="audit-count">!</div></div>';
+  }
+}
+
+async function resetDueDiligence(){
+  const res=await fetch('/api/visual-criteria/reset',{method:'POST'});
+  const data=await res.json();
+  lastVisual={reset_due_diligence:data};
+  renderAudit(data.criteria||[], false, null);
+  render();
+  statusEl.textContent='On-site due diligence reset.';
+}
+
+function renderAudit(criteria, complete, finalized){
+  if(!criteria.length){
+    auditList.innerHTML='<div class="audit-row missing"><div><div class="audit-label">No criteria configured</div></div><div class="audit-count">--</div></div>';
+    return;
+  }
+  auditList.innerHTML=criteria.map(c=>{
+    const cls=c.completed?'done':'missing';
+    const mark=c.completed?'done':'pending';
+    return `<div class="audit-row ${cls}">
+      <div>
+        <div class="audit-label">${escapeHtml(c.object)}</div>
+        <div class="audit-evidence">${escapeHtml(c.evidence || c.description || '')}</div>
+      </div>
+      <div class="audit-count">${c.current_count || 0}/${c.target_count} ${mark}</div>
+    </div>`;
+  }).join('');
+}
+
+function escapeHtml(s){
+  return String(s).replace(/[&<>"']/g, ch=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[ch]));
+}
+
+function openDueDiligence(){
+  loadDueDiligence();
+  auditList.scrollIntoView({behavior:'smooth',block:'center'});
+}
+
+async function startMeeting(){
+  meeting=true;
+  transcriptLines=[];
+  transcriptEl.innerHTML='<div class="small">Listening...</div>';
+  filesEl.innerHTML='';
+  eventEl.textContent='Starting meeting monitors...';
+  await fetch('/api/voice-reset',{method:'POST'});
+  mediaStream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:1280},height:{ideal:720}},audio:false});
+  audioStream=await navigator.mediaDevices.getUserMedia({audio:true,video:false});
+  video.srcObject=mediaStream;
+  statusEl.textContent='Meeting active. Listening and watching continuously.';
+  await loadDueDiligence();
+  runVoiceLoop();
+  runVisualLoop();
+}
+
+async function endMeeting(){
+  meeting=false;
+  clearTimeout(voiceTimer);
+  clearTimeout(visualTimer);
+  if(recorder && recorder.state !== 'inactive') recorder.stop();
+  stopTracks(mediaStream);
+  stopTracks(audioStream);
+  statusEl.textContent='Ending meeting...';
+  const res=await fetch('/api/meeting-end',{method:'POST'});
+  const data=await res.json();
+  renderFiles(data.files || {});
+        const upload=data.file_upload && data.file_upload.ok ? ' Files uploaded to Slack.' : ' Local files generated; Slack file upload fallback used.';
+        eventEl.textContent='Meeting ended. Summary and transcription files generated.'+upload;
+  statusEl.textContent='Meeting ended. Summary posted to Slack.';
+}
+
+function stopTracks(stream){
+  if(stream){ stream.getTracks().forEach(t=>t.stop()); }
+}
+
+async function toWav(blob){
+  const ac=new AudioContext();
+  const decoded=await ac.decodeAudioData(await blob.arrayBuffer());
+  ac.close();
+  const off=new OfflineAudioContext(1, Math.ceil(decoded.duration*16000), 16000);
+  const src=off.createBufferSource(); src.buffer=decoded; src.connect(off.destination); src.start();
+  const pcm=(await off.startRendering()).getChannelData(0);
+  const out=new DataView(new ArrayBuffer(44+pcm.length*2));
+  const w=(o,s)=>[...s].forEach((ch,i)=>out.setUint8(o+i,ch.charCodeAt(0)));
+  w(0,'RIFF');out.setUint32(4,36+pcm.length*2,true);w(8,'WAVE');w(12,'fmt ');out.setUint32(16,16,true);
+  out.setUint16(20,1,true);out.setUint16(22,1,true);out.setUint32(24,16000,true);out.setUint32(28,32000,true);
+  out.setUint16(32,2,true);out.setUint16(34,16,true);w(36,'data');out.setUint32(40,pcm.length*2,true);
+  for(let i=0;i<pcm.length;i++){const v=Math.max(-1,Math.min(1,pcm[i]));out.setInt16(44+i*2,v<0?v*0x8000:v*0x7fff,true);}
+  return new Blob([out],{type:'audio/wav'});
+}
+
+function pickMimeType(){
+  const types=['audio/webm;codecs=opus','audio/webm','audio/mp4'];
+  return types.find(t=>MediaRecorder.isTypeSupported(t)) || '';
+}
+
+function runVoiceLoop(){
+  if(!meeting || voiceInFlight) return;
+  voiceInFlight=true;
+  const chunks=[];
+  const mimeType=pickMimeType();
+  recorder=mimeType ? new MediaRecorder(audioStream,{mimeType}) : new MediaRecorder(audioStream);
+  recorder.ondataavailable=e=>{ if(e.data && e.data.size>0) chunks.push(e.data); };
+  recorder.onstop=async()=>{
+    try{
+      if(chunks.length){
+        voiceChunk += 1;
+        const blob=new Blob(chunks,{type:recorder.mimeType || 'audio/webm'});
+        const form=new FormData();
+        // Local Whisper (vLLM) gets 16 kHz mono WAV; the GB10 has no ffmpeg for webm/opus.
+        form.append('audio', await toWav(blob), 'meeting-'+voiceChunk+'.wav');
+        const res=await fetch('/api/voice-chunk',{method:'POST',body:form});
+        lastVoice=await res.json();
+        if(lastVoice.transcript){ addTranscript(voiceChunk,lastVoice.transcript); }
+        if(lastVoice.action && lastVoice.action !== 'transcribed' && lastVoice.action !== 'silence'){
+          eventEl.textContent='Voice action: '+lastVoice.action;
+        }
+        render();
+      }
+    }catch(err){ lastVoice={error:String(err)}; render(); }
+    finally{
+      voiceInFlight=false;
+      if(meeting) voiceTimer=setTimeout(runVoiceLoop,250);
+    }
+  };
+  recorder.start();
+  setTimeout(()=>{ if(recorder && recorder.state !== 'inactive') recorder.stop(); },2000);
+}
+
+async function runVisualLoop(){
+  if(!meeting || visualInFlight) return;
+  visualInFlight=true;
+  try{
+    const w=video.videoWidth||1280, h=video.videoHeight||720;
+    canvas.width=w; canvas.height=h;
+    canvas.getContext('2d').drawImage(video,0,0,w,h);
+    visualFrame += 1;
+    const image_data_url=canvas.toDataURL('image/jpeg',0.82);
+    const res=await fetch('/api/visual-inspection',{
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body:JSON.stringify({image_data_url,questions:'Continuous meeting monitor: check current configured visual audit criteria.',monitoring:true,tts:false})
+    });
+    lastVisual=await res.json();
+    if(lastVisual.criteria){ renderAudit(lastVisual.criteria, lastVisual.monitor && lastVisual.monitor.complete, null); }
+    render();
+  }catch(err){ lastVisual={error:String(err)}; render(); }
+  finally{
+    visualInFlight=false;
+    if(meeting) visualTimer=setTimeout(runVisualLoop,4000);
+  }
+}
+
+async function triggerDueDiligence(){
+  if(!mediaStream){
+    mediaStream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:1280},height:{ideal:720}},audio:false});
+    video.srcObject=mediaStream;
+  }
+  await runVisualLoop();
+  openDueDiligence();
+}
+
+function render(){
+  statusEl.textContent=meeting
+    ? `Meeting active. Spoken turns: ${voiceChunk}. Visual scans: ${visualFrame}.`
+    : 'Stopped.';
+  if(lastVisual && lastVisual.monitor && lastVisual.monitor.complete){
+    eventEl.textContent='On-site due diligence complete.';
+  }
+}
+
+function addTranscript(chunk,text){
+  const clean=String(text||'').trim();
+  if(!clean) return;
+  transcriptLines.push({chunk,text:clean});
+  transcriptEl.innerHTML=transcriptLines.map(item=>`<div class="utterance"><span class="chunk">Speaker</span>${escapeHtml(item.text)}</div>`).join('');
+  transcriptEl.scrollTop=transcriptEl.scrollHeight;
+}
+
+function renderFiles(files){
+  const links=[];
+  if(files.summary_url){ links.push(`<a href="${files.summary_url}" download>Download summary</a>`); }
+  if(files.transcript_url){ links.push(`<a href="${files.transcript_url}" download>Download transcription</a>`); }
+  filesEl.innerHTML=links.join('');
+}
+loadDueDiligence();
 </script></body></html>"""
 
 

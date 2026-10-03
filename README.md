@@ -45,6 +45,28 @@ python scripts/check_expected_results.py
 
 Fill `.env` with Slack tokens locally. Do not commit it.
 
+Run the unified meeting console:
+
+```bash
+python app.py
+```
+
+Open:
+
+```text
+http://127.0.0.1:5050/meeting
+```
+
+Use `Start Meeting` and `End Meeting`. Start Meeting runs continuous voice
+listening and continuous visual monitoring together; results go to Slack. End
+Meeting generates downloadable meeting summary and transcription files.
+
+On the GB10 the meeting console is the default page (`/`); the ask console moved to
+`/console`. Voice and vision run on the local Whisper and Qwen3.6 VLM. Spoken requests and
+owner-authorized disclosures (`you can share our top customers with HarborStone`, said by
+the owner) go through the same Meridian policy as Slack. Uploading the summary/transcript
+files to Slack needs the `files:write` bot scope; without it they stay downloadable here.
+
 Send a one-off webhook smoke test:
 
 ```bash
@@ -93,7 +115,7 @@ are verified the clean room runs automatically; every step is posted to Slack an
 
 ### Continuous voice meeting monitor
 
-Run the local helper:
+The standalone voice page is still available for debugging:
 
 ```bash
 python app.py
@@ -118,7 +140,7 @@ approved financial summary into Slack.
 
 ### Continuous visual field inspection
 
-For webcam-based meeting and asset checks, run the local helper page:
+The standalone visual page is still available for debugging:
 
 ```bash
 python app.py
