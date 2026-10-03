@@ -17,6 +17,8 @@ import importlib.util
 import io
 import ipaddress
 import json
+import secrets
+import socket
 import os
 import re
 import uuid
@@ -1202,7 +1204,20 @@ def process_voice_transcript(transcript: str) -> dict[str, Any]:
 # ── deal room: each party uploads one signed disclosure; the rest of its package is read locally ──
 
 DEAL_ROOM_DIR = DATA_DIR / "deal_room"
-DEAL_ROOM_URL = os.environ.get("MERIDIAN_DEAL_ROOM_URL", "http://localhost:5050/deal-room")
+
+
+def lan_ip() -> str:
+    """This machine's address on the LAN (no packet is sent; the OS just picks the outbound interface)."""
+    with contextlib.suppress(OSError), socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+        sock.connect(("10.255.255.255", 1))
+        return sock.getsockname()[0]
+    return "127.0.0.1"
+
+
+def deal_room_url(token: str) -> str:
+    # Slack users click this on their own laptops, so it must be the GB10's LAN address, not localhost.
+    base = os.environ.get("MERIDIAN_DEAL_ROOM_URL") or f"http://{lan_ip()}:5050/deal-room"
+    return f"{base}?t={token}"
 DEAL_ROOM_STATE = DEAL_ROOM_DIR / "state.json"
 PARTY_PACKAGE_DIR = {"A": "data/private_a", "B": "data/private_b"}
 # Which registered signature/key an uploaded payload is checked against, by issuer and content.
@@ -1316,21 +1331,22 @@ def reset_deal_room(ctx: Context, announce: bool = True) -> dict[str, Any]:
         AUDIT_PATH.rename(AUDIT_PATH.with_name(f"audit-{datetime.now():%Y%m%d-%H%M%S}.jsonl"))
     save_visual_criteria(load_visual_criteria(), reset_progress=True)
     VOICE_MONITOR_STATE.update({"active": False, "chunk_count": 0, "pending_request_text": None, "last_action": "reset"})
+    # The link token is the only way in from the LAN; a new room revokes the previous link.
     state = {"room_id": f"DR-{uuid.uuid4().hex[:6].upper()}", "opened_at": datetime.now(timezone.utc).isoformat(),
-             "parties": {}, "clean_room": None}
+             "token": secrets.token_urlsafe(9), "parties": {}, "clean_room": None}
     save_deal_room_state(state)
     audit_decision(ctx, "ALLOW", "DEAL_ROOM_OPENED", tool="deal_room", room_id=state["room_id"])
-    state["upload_url"] = DEAL_ROOM_URL
-    state["announcement"] = deal_room_announcement(state["room_id"])
+    state["upload_url"] = deal_room_url(state["token"])
+    state["announcement"] = deal_room_announcement(state["room_id"], state["upload_url"])
     if announce:  # from the page button; when Slack asked, the agent's own reply carries it
         post_to_slack(state["announcement"])
     return state
 
 
-def deal_room_announcement(room_id: str) -> str:
+def deal_room_announcement(room_id: str, url: str) -> str:
     return (f":handshake: *New deal room `{room_id}` started* — HarborStone Financial Group (buyer) × "
             "QuantaShield AI (target). Meridian is the neutral party.\n"
-            f"Please upload your data here: {DEAL_ROOM_URL}\n"
+            f"Please upload your data here: {url}\n"
             "• HarborStone: your signed buyer reliability disclosure\n"
             "• QuantaShield: your signed commercial disclosure\n"
             "I verify every signature on arrival and run the clean room once both sides are in. "
@@ -1347,20 +1363,29 @@ SANDBOX_NETWORK = ipaddress.ip_network(os.environ.get("MERIDIAN_SANDBOX_NETWORK"
 SANDBOX_PATHS = {"/api/visual-criteria", "/api/deal-room/reset"}
 
 
-def request_allowed(remote_addr: str | None, path: str) -> bool:
+# Laptops on the LAN (clicking the Slack link) may only use the deal room, and only with the
+# current room's link token. Reset, /api/ask and everything else stay loopback/sandbox-only.
+LAN_DEAL_ROOM_PATHS = {"/deal-room", "/api/deal-room", "/api/deal-room/upload"}
+
+
+def request_allowed(remote_addr: str | None, path: str, token: str | None = None) -> bool:
     try:
         addr = ipaddress.ip_address(remote_addr or "")
     except ValueError:
         return False
     if addr.is_loopback:
         return True
-    return addr in SANDBOX_NETWORK and path in SANDBOX_PATHS
+    if addr in SANDBOX_NETWORK and path in SANDBOX_PATHS:
+        return True
+    room_token = deal_room_state().get("token")
+    return path in LAN_DEAL_ROOM_PATHS and bool(room_token) and secrets.compare_digest(token or "", room_token)
 
 
 if app:
     @app.before_request
     def restrict_remote_callers():
-        if not request_allowed(request.remote_addr, request.path):
+        token = request.args.get("t") or request.form.get("t")
+        if not request_allowed(request.remote_addr, request.path, token):
             return jsonify({"error": "forbidden"}), 403
 
     @app.route("/")
@@ -1519,7 +1544,7 @@ if app:
 
     @app.route("/api/deal-room", methods=["GET"])
     def deal_room_status():
-        return jsonify(deal_room_state())
+        return jsonify({k: v for k, v in deal_room_state().items() if k != "token"})
 
     @app.route("/api/deal-room/upload", methods=["POST"])
     def deal_room_upload():
@@ -1981,6 +2006,8 @@ ul.pkg li span:last-child{color:var(--muted);font-size:12px}
 </main>
 <script>
 const NAMES={A:'HarborStone',B:'QuantaShield'};
+const TOKEN=new URLSearchParams(location.search).get('t')||'';
+const q=TOKEN?('?t='+encodeURIComponent(TOKEN)):'';
 function esc(s){return String(s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
 function setStatus(p,ok,html){const el=document.getElementById('status-'+p);el.className='status '+(ok===null?'':ok?'ok':'bad');el.innerHTML=html}
 function renderPkg(p,pkg){document.getElementById('pkg-'+p).innerHTML=(pkg||[]).map(f=>'<li><span>'+esc(f.file)+'</span><span>'+esc(f.classification)+'</span></li>').join('')}
@@ -1989,8 +2016,10 @@ function renderSig(sig){return '<div class="mono">issuer '+esc(sig.issuer)+' · 
 async function upload(p,file){
   if(!file) return;
   setStatus(p,null,'Verifying <b>'+esc(file.name)+'</b> …');
-  const form=new FormData(); form.append('party',p); form.append('file',file);
-  const r=await (await fetch('/api/deal-room/upload',{method:'POST',body:form})).json();
+  const form=new FormData(); form.append('party',p); form.append('file',file); form.append('t',TOKEN);
+  const resp=await fetch('/api/deal-room/upload'+q,{method:'POST',body:form});
+  if(resp.status===403){setStatus(p,false,'This link has expired — use the link from the latest “new deal” message.');return}
+  const r=await resp.json();
   if(r.decision==='ALLOW'){
     setStatus(p,true,'<span class="badge ok">VALID</span> Ed25519 signature verified for <b>'+esc(file.name)+'</b>'+renderSig(r.signature)+'<div class="hint">Package registered: '+r.package.length+' private files — never shown to the other side.</div>');
     renderPkg(p,r.package);
@@ -2001,14 +2030,21 @@ async function upload(p,file){
 }
 
 async function resetRoom(){
-  await fetch('/api/deal-room/reset',{method:'POST'});
+  const resp=await fetch('/api/deal-room/reset',{method:'POST'});
+  if(resp.status===403){alert('Only the host (GB10) or @MergeOps "new deal" can open a new deal room.');return}
+  const room=await resp.json();
+  history.replaceState(null,'','?t='+encodeURIComponent(room.token));
+  location.reload();
+  return;
   ['A','B'].forEach(p=>{setStatus(p,null,'Waiting for upload.');renderPkg(p,[])});
   load();
 }
 
 let lastRoom=null;
 async function load(){
-  const s=await (await fetch('/api/deal-room')).json();
+  const resp=await fetch('/api/deal-room'+q);
+  if(resp.status===403){document.getElementById('room').textContent='This link has expired — a new deal room was opened. Use the latest link in Slack.';return}
+  const s=await resp.json();
   document.getElementById('room').textContent=s.room_id?('Deal room '+s.room_id+' · opened '+new Date(s.opened_at).toLocaleTimeString()):'No deal room open.';
   if(lastRoom && s.room_id!==lastRoom){['A','B'].forEach(p=>{setStatus(p,null,'Waiting for upload.');renderPkg(p,[])})}
   lastRoom=s.room_id;

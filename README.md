@@ -78,6 +78,12 @@ audit trail and resets the meeting monitors. Each party then uploads one signed 
 - QuantaShield: `meridian_finance_ai_demo_bundle/signed_inputs/startup_commercial_authorized.json`
 - Tamper demo: `ATTACK_tampered_startup_metrics.json` (ARR 11.8 → 15.8) is rejected as INVALID
 
+`@MergeOps new deal` replies with a link on the GB10's LAN address
+(`http://<gb10-ip>:5050/deal-room?t=<token>`) so laptops can open it. From the LAN only the
+deal-room page/state/upload accept requests, and only with the current room's token; opening
+a new room revokes the old link. Override the base with `MERIDIAN_DEAL_ROOM_URL` if needed.
+Venue Wi-Fi with client isolation blocks laptop→GB10 traffic; then open the link on the GB10.
+
 Uploads are Ed25519-verified against the registered issuer key, and a party can only submit
 disclosures it issued. The rest of each package is registered from local disk. When both sides
 are verified the clean room runs automatically; every step is posted to Slack and audited.
