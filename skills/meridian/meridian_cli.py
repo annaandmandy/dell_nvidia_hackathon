@@ -31,6 +31,7 @@ HOST_API = os.environ.get("MERIDIAN_HOST_API", "http://host.openshell.internal:5
 
 
 NEW_ROOM_PHRASES = ("new deal", "start a new deal", "new demo", "reset the demo", "open a deal room")
+MEETING_PHRASES = ("start meeting", "start the meeting", "start a meeting", "open the meeting", "open a meeting")
 
 
 def host_post(path: str, body: dict | None = None) -> dict:
@@ -73,6 +74,10 @@ def main() -> None:
     if any(p in question.lower() for p in NEW_ROOM_PHRASES):
         room = host_post("/api/deal-room/reset", {"announce": False, "actor_id": args.sender})
         print(f"*Meridian* — `ALLOW` / `DEAL_ROOM_OPENED`\n{room['announcement']}")
+        return
+    if any(p in question.lower() for p in MEETING_PHRASES):
+        room = host_post("/api/room/start", {"announce": False, "actor_id": args.sender})
+        print(f"*Meridian* — `ALLOW` / `MEETING_STARTED`\n{room['announcement']}")
         return
     if is_visual_criteria_command(question):
         print(format_criteria_response(host_criteria(question)))

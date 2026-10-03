@@ -19,11 +19,12 @@ import ipaddress
 import json
 import secrets
 import socket
+import threading
 import os
 import re
 import uuid
 from dataclasses import dataclass
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -1613,18 +1614,260 @@ def deal_room_announcement(room_id: str, people: Any) -> str:
             "Private data stays with its owner; only approved aggregates are shared.")
 
 
+# ── Meridian-hosted meeting room (plan B): each party joins from its own laptop with a personal
+# Slack-DM link. Audio/video flow peer-to-peer (WebRTC); Meridian only relays signaling. Each
+# browser also sends its own mic chunks and camera frames here, so every transcript line and every
+# asset observation is attributed to a Slack-verified person. ──
+
+ROOM_LOCK = threading.Lock()
+MEETING_ROOM: dict[str, Any] = {"id": None}
+B_TOPICS = ("commercial", "valuation", "115", " arr", "revenue", "technology", "profit", "benchmark", "patent",
+            " ip", "open-source", "open source", "training", "change-of-control", "change of control", "customer")
+A_TOPICS = ("fund", "earnout", "reliab", "liquidity", "leverage", "covenant", "financing")
+
+
+def room_url(token: str) -> str:
+    base = os.environ.get("MERIDIAN_ROOM_URL") or f"https://{lan_ip()}:5443/room"
+    return f"{base}?t={token}"
+
+
+def meeting_identity(token: str | None) -> dict[str, str] | None:
+    for known, person in (MEETING_ROOM.get("tokens") or {}).items():
+        if token and secrets.compare_digest(token, known):
+            return person
+    return None
+
+
+def room_event(kind: str, text: str, **extra: Any) -> None:
+    MEETING_ROOM["events"].append({"t": datetime.now(timezone.utc).isoformat(), "kind": kind, "text": text, **extra})
+
+
+def start_meeting(ctx: Context, announce: bool = True) -> dict[str, Any]:
+    tokens = {secrets.token_urlsafe(12): person for person in deal_room_people()}
+    with ROOM_LOCK:
+        MEETING_ROOM.clear()
+        MEETING_ROOM.update({
+            "id": f"MTG-{uuid.uuid4().hex[:6].upper()}", "started_at": datetime.now(timezone.utc).isoformat(),
+            "tokens": tokens, "seen": {}, "signals": [], "next_signal": 1, "transcript": [], "events": [],
+            "pending": None, "asset_owner": {}, "ended": None,
+        })
+        save_visual_criteria(load_visual_criteria(), reset_progress=True)
+        VISUAL_MONITOR_STATE.update({"finalized": None, "frame_count": 0})
+    audit_decision(ctx, "ALLOW", "MEETING_STARTED", tool="meeting_room", meeting_id=MEETING_ROOM["id"])
+    for token, person in tokens.items():
+        post_dm(person["user"], f":video_camera: *Your personal link to Meridian meeting `{MEETING_ROOM['id']}`*\n"
+                                f"Joining as *{person['name']}* ({person['title']}, {person['company']}).\n{room_url(token)}\n"
+                                "First visit: Chrome warns about the local certificate — choose Advanced → Proceed. "
+                                "Everything you say and show is attributed to your Slack account.")
+    names = ", ".join(f"{p['name']} ({p['company']})" for p in tokens.values())
+    announcement = (f":video_camera: *Meridian meeting `{MEETING_ROOM['id']}` is open* — hosted locally on the GB10 by the "
+                    f"neutral party.\nPersonal join links sent by DM to {names}.\n"
+                    "Ask for material out loud (\"Meridian, can we see …\"); the owning party approves by voice. "
+                    "Requests for the other side's private data are denied on the spot.")
+    if announce:
+        post_to_slack(announcement)
+    return {"meeting_id": MEETING_ROOM["id"], "announcement": announcement}
+
+
+def topic_owner(text: str, requester_party: str) -> str:
+    t = " " + text.lower()
+    if any(k in t for k in A_TOPICS):
+        return "A"
+    if any(k in t for k in B_TOPICS):
+        return "B"
+    return "B" if requester_party == "A" else "A"
+
+
+def room_speech(person: dict[str, str], text: str) -> dict[str, Any]:
+    """One transcribed utterance from a Slack-verified participant."""
+    ctx = Context(actor_id=person["user"], organization=person["party"], channel_type="JOINT_MEETING",
+                  session_id=MEETING_ROOM["id"] or "meeting")
+    MEETING_ROOM["transcript"].append({"t": datetime.now(timezone.utc).isoformat(), "user": person["user"],
+                                       "name": person["name"], "party": person["party"], "text": text})
+    speaker = f"{person['name']} ({PARTY[person['party']]})"
+
+    disclosure = detect_owner_authorized_disclosure(text, ctx)
+    if disclosure:
+        result = owner_authorized_disclosure(ctx, disclosure)
+        post_to_slack(f":unlock: *Meeting `{MEETING_ROOM['id']}` — owner-authorized disclosure by {speaker}*\n"
+                      + format_response(result))
+        room_event("disclosure", f"{speaker} released {disclosure['resource_id']} to {PARTY[disclosure['target_org']]}",
+                   decision="ALLOW", reason_code=result["reason_code"])
+        return {"action": "owner_disclosure"}
+
+    pending = MEETING_ROOM.get("pending")
+    if pending and detect_consent(text):
+        if person["party"] != pending["owner"]:
+            room_event("consent_ignored", f"{speaker} said yes, but only {PARTY[pending['owner']]} can approve this.")
+            return {"action": "consent_ignored"}
+        MEETING_ROOM["pending"] = None
+        post_to_slack(f":white_check_mark: *Meeting `{MEETING_ROOM['id']}`* — {speaker} approved the request by "
+                      f"{pending['by_name']}: “{pending['request']}”\n" + format_response(pending["result"]))
+        audit_decision(ctx, "ALLOW", "VOICE_CONSENT_RELEASE", tool="meeting_room", requested_by=pending["by"])
+        room_event("released", f"{speaker} approved — released to Slack", decision="ALLOW",
+                   reason_code=pending["result"]["reason_code"], request=pending["request"], by=pending["by_name"])
+        return {"action": "released"}
+
+    if detect_document_request(text):
+        result = handle_request(text, ctx)
+        if result["decision"] == "DENY":
+            post_to_slack(f":no_entry: *Meeting `{MEETING_ROOM['id']}`* — request by {speaker} denied: “{text}”\n"
+                          + format_response(result))
+            room_event("denied", f"Denied request by {speaker}", decision="DENY", reason_code=result["reason_code"],
+                       request=text, by=person["name"])
+            return {"action": "denied"}
+        owner = topic_owner(text, person["party"])
+        if owner == person["party"] or result["reason_code"] in {"AGENDA", "NO_TOOL_NEEDED"}:
+            post_to_slack(f":page_facing_up: *Meeting `{MEETING_ROOM['id']}`* — {speaker} pulled: “{text}”\n"
+                          + format_response(result))
+            room_event("released", f"{speaker} pulled their own / joint material", decision="ALLOW",
+                       reason_code=result["reason_code"], request=text, by=person["name"])
+            return {"action": "released"}
+        MEETING_ROOM["pending"] = {"request": text, "by": person["user"], "by_name": person["name"], "owner": owner,
+                                   "result": result}
+        room_event("pending", f"{speaker} asked: “{text}” — waiting for {PARTY[owner]} to approve")
+        return {"action": "pending"}
+    return {"action": "transcribed"}
+
+
+def room_frame(person: dict[str, str], image_data_url: str) -> dict[str, Any]:
+    """Asset check from one participant's own camera; observations are attributed to that person."""
+    before = {c["id"]: c.get("completed") for c in load_visual_criteria()}
+    result = inspect_visual_frame(image_data_url, f"Frame from {person['title']}'s camera.", load_visual_criteria())
+    criteria = apply_visual_results_to_criteria(result)
+    for c in criteria:
+        if c.get("completed") and not before.get(c["id"]):
+            MEETING_ROOM["asset_owner"][c["id"]] = person["name"]
+            room_event("asset", f"Verified {c['object']} ({c.get('current_count', 0)}/{c['target_count']}) on "
+                                f"{person['name']}'s camera — {c.get('evidence', '')}")
+    if criteria_complete(criteria) and VISUAL_MONITOR_STATE.get("finalized") != "ALLOW":
+        VISUAL_MONITOR_STATE["finalized"] = "ALLOW"
+        lines = [f"• {c['object']}: {c.get('current_count', 0)}/{c['target_count']} — via "
+                 f"{MEETING_ROOM['asset_owner'].get(c['id'], 'camera')}" for c in criteria]
+        post_to_slack(f":white_check_mark: *Meeting `{MEETING_ROOM['id']}` — on-site asset verification ALLOW*\n"
+                      + "\n".join(lines))
+        room_event("asset", "All asset criteria verified — posted to Slack", decision="ALLOW")
+    return {"criteria": criteria, "summary": result.get("summary")}
+
+
+def end_meeting(by: str) -> dict[str, Any]:
+    with ROOM_LOCK:
+        if MEETING_ROOM.get("ended"):
+            return MEETING_ROOM["ended"]
+        out_dir = DATA_DIR / "meetings"
+        out_dir.mkdir(parents=True, exist_ok=True)
+        mid = MEETING_ROOM["id"]
+        transcript_path = out_dir / f"{mid}_transcript.txt"
+        report_path = out_dir / f"{mid}_report.md"
+        transcript_path.write_text("\n".join(
+            f"[{x['t'][11:19]}] {x['name']} ({PARTY[x['party']]}): {x['text']}" for x in MEETING_ROOM["transcript"]
+        ) + "\n", encoding="utf-8")
+
+        events = MEETING_ROOM["events"]
+        released = [e for e in events if e["kind"] in {"released", "disclosure"}]
+        denied_ = [e for e in events if e["kind"] == "denied"]
+        criteria = load_visual_criteria()
+        terms = _json("data/joint_approved/deal_terms.json")
+        ip = _json("data/joint_approved/ip_legal_summary.json")
+        started = datetime.fromisoformat(MEETING_ROOM["started_at"])
+        nxt = started + timedelta(days=7)
+        nxt += timedelta(days=(7 - nxt.weekday()) % 7 if nxt.weekday() >= 5 else 0)  # weekend -> Monday
+        next_meeting = nxt.strftime("%A %Y-%m-%d")
+        people = {x["name"]: PARTY[x["party"]] for x in MEETING_ROOM["transcript"]}
+        lines = [
+            f"# Meridian meeting report — {mid}",
+            "",
+            f"- Participants: {', '.join(f'{n} ({c})' for n, c in people.items()) or 'none spoke'}",
+            f"- Started {MEETING_ROOM['started_at'][:19]}Z · ended {datetime.now(timezone.utc).isoformat()[:19]}Z · ended by {by}",
+            f"- {len(MEETING_ROOM['transcript'])} attributed utterances · {len(released)} releases · {len(denied_)} denials",
+            "",
+            "## Material released",
+            *([f"- {e['text']}: “{e.get('request', '')}” (`{e.get('reason_code')}`)" for e in released] or ["- none"]),
+            "",
+            "## Requests denied by policy",
+            *([f"- {e.get('by')}: “{e.get('request')}” (`{e.get('reason_code')}`)" for e in denied_] or ["- none"]),
+            "",
+            "## On-site asset verification",
+            *[f"- [{'x' if c.get('completed') else ' '}] {c['object']} {c.get('current_count', 0)}/{c['target_count']}"
+              + (f" — via {MEETING_ROOM['asset_owner'][c['id']]}" if c["id"] in MEETING_ROOM["asset_owner"] else "")
+              for c in criteria],
+            "",
+            "## Next steps — closing conditions",
+            *[f"- [ ] {c}" for c in terms["closing_conditions"]],
+            "",
+            "## Open risk items and agreed responses",
+            *[f"- [{i['risk'].upper()}] {i['issue']} → {i['deal_response']}" for i in ip["high_or_critical_items"]],
+            "",
+            "## Proposed structure on the table",
+            f"- {m(terms['cash_to_sellers_at_close_usd_m'])} cash at close + {m(terms['ip_compliance_escrow_usd_m'])} escrow + "
+            f"up to {m(terms['performance_earnout_usd_m'])} earnout (headline up to {m(terms['neutral_headline_ev_usd_m'])})",
+            "",
+            f"## Next meeting\n- Proposed: {next_meeting}, same participants — review closing-condition evidence.",
+            "",
+            f"_{DISCLAIMER}_",
+        ]
+        report_path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+        audit_decision(Context(by, "NEUTRAL", "JOINT_MEETING", session_id=mid), "ALLOW", "MEETING_ENDED",
+                       tool="meeting_room", releases=len(released), denials=len(denied_))
+        post_to_slack(
+            f":memo: *Meridian meeting `{mid}` — report*\n"
+            f"Participants: {', '.join(f'{n} ({c})' for n, c in people.items()) or 'none spoke'}\n"
+            f"Released: {len(released)} · Denied by policy: {len(denied_)} · "
+            f"Assets verified: {sum(bool(c.get('completed')) for c in criteria)}/{len(criteria)}\n"
+            "*Next steps*\n" + "\n".join(f"• {c}" for c in terms["closing_conditions"])
+            + f"\n*Next meeting:* {next_meeting} — review closing-condition evidence.\n"
+            f"Full report and attributed transcript: `{report_path.name}`, `{transcript_path.name}` on the GB10."
+        )
+        MEETING_ROOM["ended"] = {"report_url": f"/media/meetings/{report_path.name}",
+                                 "transcript_url": f"/media/meetings/{transcript_path.name}", "next_meeting": next_meeting}
+        return MEETING_ROOM["ended"]
+
+
+def room_state(me: dict[str, str] | None) -> dict[str, Any]:
+    now = datetime.now(timezone.utc).timestamp()
+    if me:
+        MEETING_ROOM["seen"][me["user"]] = now
+    tokens = MEETING_ROOM.get("tokens") or {}
+    participants = [{**p, "online": now - MEETING_ROOM["seen"].get(p["user"], 0) < 6} for p in tokens.values()]
+    pending = MEETING_ROOM.get("pending")
+    return {
+        "meeting_id": MEETING_ROOM.get("id"), "me": me, "participants": participants,
+        "transcript": MEETING_ROOM.get("transcript", [])[-60:], "events": MEETING_ROOM.get("events", [])[-40:],
+        "pending": pending and {k: pending[k] for k in ("request", "by_name", "owner")},
+        "criteria": load_visual_criteria(), "ended": MEETING_ROOM.get("ended"),
+    }
+
+
+def ensure_tls_cert() -> tuple[str, str]:
+    """Self-signed cert for the LAN address: browsers only allow camera/mic on HTTPS (or localhost)."""
+    tls = DATA_DIR / "tls"
+    cert, key = tls / "cert.pem", tls / "key.pem"
+    ip = lan_ip()
+    marker = tls / "ip.txt"
+    if not (cert.exists() and key.exists() and marker.exists() and marker.read_text() == ip):
+        tls.mkdir(parents=True, exist_ok=True)
+        import subprocess
+        subprocess.run(["openssl", "req", "-x509", "-newkey", "rsa:2048", "-nodes", "-days", "30",
+                        "-keyout", str(key), "-out", str(cert), "-subj", "/CN=Meridian GB10",
+                        "-addext", f"subjectAltName=IP:{ip},IP:127.0.0.1,DNS:localhost"],
+                       check=True, capture_output=True)
+        marker.write_text(ip)
+    return str(cert), str(key)
+
+
 # The OpenClaw sandbox reaches this host as host.openshell.internal (a Docker bridge address).
 # Loopback gets everything; the bridge only gets the endpoints the skill needs; anyone else
 # (e.g. the venue Wi-Fi when bound to 0.0.0.0) is refused, since /api/ask trusts the
 # organization/channel it is given.
 # Subnet of the openshell-docker network (docker network inspect openshell-docker).
 SANDBOX_NETWORK = ipaddress.ip_network(os.environ.get("MERIDIAN_SANDBOX_NETWORK", "172.18.0.0/16"))
-SANDBOX_PATHS = {"/api/visual-criteria", "/api/deal-room/reset", "/api/owner-disclosure"}
+SANDBOX_PATHS = {"/api/visual-criteria", "/api/deal-room/reset", "/api/owner-disclosure", "/api/room/start"}
 
 
 # Laptops on the LAN (clicking the Slack link) may only use the deal room, and only with the
 # current room's link token. Reset, /api/ask and everything else stay loopback/sandbox-only.
 LAN_DEAL_ROOM_PATHS = {"/deal-room", "/api/deal-room", "/api/deal-room/upload"}
+LAN_ROOM_PATHS = {"/room", "/api/room/state", "/api/room/signal", "/api/room/audio", "/api/room/frame", "/api/room/end"}
 
 
 def request_allowed(remote_addr: str | None, path: str, token: str | None = None) -> bool:
@@ -1636,6 +1879,8 @@ def request_allowed(remote_addr: str | None, path: str, token: str | None = None
         return True
     if addr in SANDBOX_NETWORK and path in SANDBOX_PATHS:
         return True
+    if path in LAN_ROOM_PATHS:
+        return meeting_identity(token) is not None
     return path in LAN_DEAL_ROOM_PATHS and deal_room_identity(token) is not None
 
 
@@ -1841,6 +2086,76 @@ if app:
             return jsonify({"error": "party (A|B) and file are required"}), 400
         ctx = Context(actor_id=actor, organization=party, channel_type=f"{party}_DM", session_id="deal-room")
         return jsonify(ingest_upload(party, upload.filename or "disclosure.json", upload.read(), ctx))
+
+    @app.route("/room")
+    def room_page() -> str:
+        return ROOM_HTML
+
+    @app.route("/api/room/start", methods=["POST"])
+    def room_start():
+        body = request.get_json(silent=True) or {}
+        ctx = Context(actor_id=body.get("actor_id") or "host-moderator", organization="NEUTRAL",
+                      channel_type="JOINT_MEETING", session_id="meeting")
+        return jsonify(start_meeting(ctx, announce=body.get("announce", True)))
+
+    def room_caller() -> dict[str, str] | None:
+        return meeting_identity(request.args.get("t"))
+
+    @app.route("/api/room/state")
+    def room_state_api():
+        if not MEETING_ROOM.get("id"):
+            return jsonify({"meeting_id": None})
+        return jsonify(room_state(room_caller()))
+
+    @app.route("/api/room/signal", methods=["GET", "POST"])
+    def room_signal():
+        me = room_caller()
+        if not me:
+            return jsonify({"error": "participants only"}), 403
+        with ROOM_LOCK:
+            if request.method == "POST":
+                body = request.get_json(silent=True) or {}
+                MEETING_ROOM["signals"].append({"id": MEETING_ROOM["next_signal"], "from": me["user"],
+                                                "to": body.get("to"), "payload": body.get("payload")})
+                MEETING_ROOM["next_signal"] += 1
+                MEETING_ROOM["signals"] = MEETING_ROOM["signals"][-200:]
+                return jsonify({"ok": True})
+            since = int(request.args.get("since") or 0)
+            return jsonify([x for x in MEETING_ROOM["signals"] if x["id"] > since and x["to"] == me["user"]])
+
+    @app.route("/api/room/audio", methods=["POST"])
+    def room_audio():
+        me = room_caller()
+        audio = request.files.get("audio")
+        if not me or not audio or MEETING_ROOM.get("ended"):
+            return jsonify({"error": "participants only, meeting open"}), 403
+        try:
+            text = transcribe_audio(audio.read(), "chunk.wav", "audio/wav")
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 502
+        if not text or text.strip().lower().strip(".!? ") in {"", "you", "thank you", "thanks for watching", "bye"}:
+            return jsonify({"action": "silence"})
+        with ROOM_LOCK:
+            return jsonify({"text": text, **room_speech(me, text)})
+
+    @app.route("/api/room/frame", methods=["POST"])
+    def room_frame_api():
+        me = room_caller()
+        body = request.get_json(silent=True) or {}
+        if not me or not str(body.get("image_data_url", "")).startswith("data:image/"):
+            return jsonify({"error": "participants only"}), 403
+        try:
+            return jsonify(room_frame(me, body["image_data_url"]))
+        except Exception as exc:
+            return jsonify({"error": str(exc)}), 502
+
+    @app.route("/api/room/end", methods=["POST"])
+    def room_end():
+        me = room_caller()
+        loopback = ipaddress.ip_address(request.remote_addr or "0.0.0.0").is_loopback
+        if not (me or loopback) or not MEETING_ROOM.get("id"):
+            return jsonify({"error": "forbidden"}), 403
+        return jsonify(end_meeting(me["name"] if me else "host"))
 
     @app.route("/api/owner-disclosure", methods=["POST"])
     def owner_disclosure():
@@ -2731,9 +3046,234 @@ loadDueDiligence();
 </script></body></html>"""
 
 
+ROOM_HTML = r"""<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Meridian Meeting</title>
+<style>
+:root{--bg:#0e1116;--panel:#161b22;--line:#29313f;--text:#e7edf5;--muted:#93a4b8;--a:#3b82f6;--b:#f59e0b;--ok:#22c55e;--bad:#ef4444}
+*{box-sizing:border-box}
+body{margin:0;font-family:-apple-system,BlinkMacSystemFont,"Segoe UI",sans-serif;background:var(--bg);color:var(--text)}
+main{max-width:1320px;margin:0 auto;padding:18px 16px}
+header{display:flex;flex-wrap:wrap;gap:10px;align-items:center;justify-content:space-between;margin-bottom:14px}
+h1{font-size:20px;margin:0}
+.synthetic{display:inline-block;padding:2px 8px;border-radius:4px;background:#7f1d1d;color:#fecaca;font-size:11px;font-weight:700;margin-left:8px;vertical-align:middle}
+.muted{color:var(--muted);font-size:13px}
+.people{display:flex;gap:8px;flex-wrap:wrap}
+.chip{display:flex;align-items:center;gap:6px;padding:4px 10px;border-radius:999px;background:#1f2631;font-size:13px}
+.dot{width:8px;height:8px;border-radius:50%;background:#475569}.dot.on{background:var(--ok)}
+.layout{display:grid;grid-template-columns:minmax(0,1.6fr) minmax(300px,1fr);gap:14px}
+@media (max-width:900px){.layout{grid-template-columns:1fr}}
+.stage{position:relative;background:#000;border-radius:10px;overflow:hidden;aspect-ratio:16/9;border:1px solid var(--line)}
+.stage video{width:100%;height:100%;object-fit:cover;background:#05070a}
+#local{position:absolute;right:12px;bottom:12px;width:26%;aspect-ratio:16/9;height:auto;border-radius:8px;border:2px solid #334155}
+.tag{position:absolute;left:12px;bottom:12px;padding:3px 10px;border-radius:6px;background:rgba(0,0,0,.6);font-size:13px}
+.waiting{position:absolute;inset:0;display:flex;align-items:center;justify-content:center;color:var(--muted);font-size:15px;text-align:center;padding:20px}
+.controls{display:flex;flex-wrap:wrap;gap:8px;margin-top:10px}
+button{border-radius:8px;border:1px solid #334155;background:#212936;color:var(--text);padding:9px 14px;font-weight:600;cursor:pointer;font-size:14px}
+button.on{background:#14532d;border-color:#166534}button.off{background:#3f1d1d;border-color:#7f1d1d}
+button.end{background:var(--bad);border-color:var(--bad);margin-left:auto}
+.panel{background:var(--panel);border:1px solid var(--line);border-radius:10px;padding:12px;display:flex;flex-direction:column;gap:10px;min-height:0}
+.panel h2{font-size:14px;margin:0;color:var(--muted);text-transform:uppercase;letter-spacing:.04em}
+.pending{padding:10px;border-radius:8px;background:#2a2112;border:1px solid #7c5a10;font-size:14px}
+.list{overflow:auto;max-height:30vh;display:flex;flex-direction:column;gap:6px;font-size:14px}
+.ev{padding:7px 9px;border-radius:6px;background:#1c222c;border-left:3px solid #475569}
+.ev.ALLOW{border-left-color:var(--ok)}.ev.DENY{border-left-color:var(--bad)}.ev.pending{border-left-color:var(--b)}
+.ev code{font-size:12px;color:#c7d2fe}
+.line b.A{color:#93c5fd}.line b.B{color:#fcd34d}
+.crit{font-size:13px;display:flex;flex-direction:column;gap:3px}
+pre{white-space:pre-wrap;background:#0b0f14;border:1px solid var(--line);border-radius:8px;padding:12px;font-size:13px;max-height:50vh;overflow:auto}
+.err{padding:30px;text-align:center;color:var(--muted)}
+</style>
+</head>
+<body><main>
+<header>
+  <div>
+    <h1>Meridian meeting <span id="mid"></span><span class="synthetic">SYNTHETIC DEMO DATA</span></h1>
+    <div class="muted" id="who">Connecting…</div>
+  </div>
+  <div class="people" id="people"></div>
+</header>
+<div id="app" class="layout">
+  <section>
+    <div class="stage">
+      <video id="remote" autoplay playsinline></video>
+      <div class="waiting" id="waiting">Waiting for the other party to join…</div>
+      <div class="tag" id="remoteTag" hidden></div>
+      <video id="local" autoplay playsinline muted></video>
+    </div>
+    <div class="controls">
+      <button id="micBtn" class="on" onclick="toggleMic()">Mic on</button>
+      <button id="camBtn" class="on" onclick="toggleCam()">Camera on</button>
+      <button id="verifyBtn" onclick="toggleVerify()">Verify my assets: off</button>
+      <button class="end" onclick="endMeeting()">End meeting</button>
+    </div>
+    <div class="muted" id="netStatus" style="margin-top:8px"></div>
+    <pre id="report" hidden></pre>
+  </section>
+  <aside class="panel">
+    <div id="pending" class="pending" hidden></div>
+    <h2>Meridian</h2>
+    <div class="list" id="events"></div>
+    <h2>Transcript (Slack-verified speakers)</h2>
+    <div class="list" id="transcript"></div>
+    <h2>Asset verification</h2>
+    <div class="crit" id="criteria"></div>
+  </aside>
+</div>
+<script>
+const T=new URLSearchParams(location.search).get('t')||'';
+const COMPANY={A:'HarborStone',B:'QuantaShield'};
+let me=null, peer=null, pc=null, stream=null, since=0, iceQueue=[], micOn=true, camOn=true, verifyOn=false, ended=false;
+const $=id=>document.getElementById(id);
+function esc(s){return String(s==null?'':s).replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]))}
+async function api(path, opts){
+  const r=await fetch(path+(path.indexOf('?')<0?'?':'&')+'t='+encodeURIComponent(T), opts);
+  if(r.status===403) throw new Error('forbidden');
+  return r.json();
+}
+function post(path, body){return api(path,{method:'POST',headers:{'Content-Type':'application/json'},body:JSON.stringify(body)})}
+
+async function init(){
+  let s;
+  try{ s=await api('/api/room/state'); }catch(e){ s={}; }
+  if(!s.me){ $('app').innerHTML='<div class="err">This meeting link is not valid any more. Use the latest link Meridian sent you in Slack.</div>'; $('who').textContent=''; return; }
+  me=s.me; $('mid').textContent=s.meeting_id;
+  $('who').innerHTML='Signed in via Slack as <b>'+esc(me.name)+'</b> — '+esc(me.title)+' · '+esc(me.company);
+  stream=await navigator.mediaDevices.getUserMedia({video:{width:{ideal:1280},height:{ideal:720}},audio:{echoCancellation:true,noiseSuppression:true,autoGainControl:true}});
+  $('local').srcObject=stream;
+  render(s);
+  setInterval(pollState,1500); setInterval(pollSignals,700);
+  audioLoop(); setInterval(frameTick,7000);
+  pollSignals();
+}
+
+// ── WebRTC: two participants, peer-to-peer; Meridian only relays the signaling messages ──
+function ensurePc(){
+  if(pc) return pc;
+  pc=new RTCPeerConnection({iceServers:[]});
+  stream.getTracks().forEach(t=>pc.addTrack(t,stream));
+  pc.ontrack=e=>{ $('remote').srcObject=e.streams[0]; $('waiting').hidden=true; };
+  pc.onicecandidate=e=>{ if(e.candidate && peer) post('/api/room/signal',{to:peer.user,payload:{type:'ice',candidate:e.candidate}}); };
+  pc.onconnectionstatechange=()=>{
+    $('netStatus').textContent='Peer connection: '+pc.connectionState;
+    if(pc.connectionState==='failed'){ $('netStatus').textContent='Peer connection failed — the network may block device-to-device traffic. Meridian still hears and sees each side.'; }
+  };
+  return pc;
+}
+async function makeOffer(){
+  ensurePc();
+  const offer=await pc.createOffer(); await pc.setLocalDescription(offer);
+  post('/api/room/signal',{to:peer.user,payload:{type:'offer',sdp:pc.localDescription}});
+}
+function resetPc(){ if(pc){pc.close();} pc=null; iceQueue=[]; $('remote').srcObject=null; $('waiting').hidden=false; }
+async function pollSignals(){
+  if(!me) return;
+  let msgs=[]; try{ msgs=await api('/api/room/signal?since='+since); }catch(e){ return; }
+  for(const m of msgs){
+    since=Math.max(since,m.id); const p=m.payload||{};
+    if(!peer || peer.user!==m.from) peer={user:m.from};
+    if(p.type==='hello'){ if(me.user>m.from){ resetPc(); await makeOffer(); } }
+    else if(p.type==='offer'){ resetPc(); ensurePc(); await pc.setRemoteDescription(p.sdp);
+      const ans=await pc.createAnswer(); await pc.setLocalDescription(ans);
+      post('/api/room/signal',{to:m.from,payload:{type:'answer',sdp:pc.localDescription}});
+      for(const c of iceQueue){ await pc.addIceCandidate(c); } iceQueue=[]; }
+    else if(p.type==='answer' && pc){ await pc.setRemoteDescription(p.sdp); for(const c of iceQueue){ await pc.addIceCandidate(c); } iceQueue=[]; }
+    else if(p.type==='ice'){ if(pc && pc.remoteDescription){ try{ await pc.addIceCandidate(p.candidate); }catch(e){} } else iceQueue.push(p.candidate); }
+  }
+}
+let greeted=false;
+async function pollState(){
+  let s; try{ s=await api('/api/room/state'); }catch(e){ return; }
+  const other=(s.participants||[]).find(p=>p.user!==me.user && p.online);
+  if(other && !greeted){ greeted=true; peer=other; post('/api/room/signal',{to:other.user,payload:{type:'hello'}}); if(me.user>other.user && !pc) makeOffer(); }
+  if(!other && greeted){ greeted=false; resetPc(); }
+  if(other){ peer=other; $('remoteTag').hidden=false; $('remoteTag').textContent=other.name+' · '+other.company; } else { $('remoteTag').hidden=true; }
+  render(s);
+}
+
+// ── Speech: each browser sends only its own mic, so every line is attributed to its Slack identity ──
+function audioLoop(){
+  if(ended) return;
+  const rec=new MediaRecorder(new MediaStream(stream.getAudioTracks()));
+  const chunks=[]; rec.ondataavailable=e=>{ if(e.data.size) chunks.push(e.data); };
+  rec.onstop=async()=>{
+    audioLoop();
+    if(!micOn || !chunks.length) return;
+    try{
+      const w=await toWav(new Blob(chunks,{type:rec.mimeType}));
+      if(w.rms<0.012) return;  // silence: don't send (saves GPU, avoids Whisper hallucinations)
+      const form=new FormData(); form.append('audio',w.blob,'chunk.wav');
+      await fetch('/api/room/audio?t='+encodeURIComponent(T),{method:'POST',body:form});
+      pollState();
+    }catch(e){}
+  };
+  rec.start(); setTimeout(()=>rec.state!=='inactive'&&rec.stop(),6000);
+}
+async function toWav(blob){
+  const ac=new AudioContext(); const dec=await ac.decodeAudioData(await blob.arrayBuffer()); ac.close();
+  const off=new OfflineAudioContext(1,Math.ceil(dec.duration*16000),16000);
+  const src=off.createBufferSource(); src.buffer=dec; src.connect(off.destination); src.start();
+  const pcm=(await off.startRendering()).getChannelData(0);
+  let sum=0; for(let i=0;i<pcm.length;i++) sum+=pcm[i]*pcm[i];
+  const out=new DataView(new ArrayBuffer(44+pcm.length*2));
+  const w=(o,s)=>{for(let i=0;i<s.length;i++) out.setUint8(o+i,s.charCodeAt(i));};
+  w(0,'RIFF');out.setUint32(4,36+pcm.length*2,true);w(8,'WAVE');w(12,'fmt ');out.setUint32(16,16,true);
+  out.setUint16(20,1,true);out.setUint16(22,1,true);out.setUint32(24,16000,true);out.setUint32(28,32000,true);
+  out.setUint16(32,2,true);out.setUint16(34,16,true);w(36,'data');out.setUint32(40,pcm.length*2,true);
+  for(let i=0;i<pcm.length;i++){const v=Math.max(-1,Math.min(1,pcm[i]));out.setInt16(44+i*2,v<0?v*32768:v*32767,true);}
+  return {blob:new Blob([out],{type:'audio/wav'}), rms:Math.sqrt(sum/Math.max(1,pcm.length))};
+}
+
+// ── Asset verification from this participant's own camera ──
+async function frameTick(){
+  if(!verifyOn || !camOn || ended) return;
+  const v=$('local'); if(!v.videoWidth) return;
+  const c=document.createElement('canvas'); const scale=Math.min(1,960/v.videoWidth);
+  c.width=v.videoWidth*scale; c.height=v.videoHeight*scale; c.getContext('2d').drawImage(v,0,0,c.width,c.height);
+  try{ await post('/api/room/frame',{image_data_url:c.toDataURL('image/jpeg',0.8)}); pollState(); }catch(e){}
+}
+
+function toggleMic(){ micOn=!micOn; stream.getAudioTracks().forEach(t=>t.enabled=micOn); $('micBtn').className=micOn?'on':'off'; $('micBtn').textContent=micOn?'Mic on':'Mic off'; }
+function toggleCam(){ camOn=!camOn; stream.getVideoTracks().forEach(t=>t.enabled=camOn); $('camBtn').className=camOn?'on':'off'; $('camBtn').textContent=camOn?'Camera on':'Camera off'; }
+function toggleVerify(){ verifyOn=!verifyOn; $('verifyBtn').className=verifyOn?'on':''; $('verifyBtn').textContent='Verify my assets: '+(verifyOn?'on':'off'); if(verifyOn) frameTick(); }
+async function endMeeting(){
+  if(ended) return;
+  const r=await post('/api/room/end',{}); showEnded(r);
+}
+function showEnded(r){
+  if(!r || ended) return; ended=true;
+  $('report').hidden=false;
+  $('report').textContent='Meeting ended — the report and next steps were posted to Slack.\nNext meeting proposed: '+(r.next_meeting||'—');
+  ['micBtn','camBtn','verifyBtn'].forEach(id=>$(id).disabled=true);
+  resetPc(); if(stream) stream.getTracks().forEach(t=>t.stop());
+}
+
+function render(s){
+  $('people').innerHTML=(s.participants||[]).map(p=>'<span class="chip"><span class="dot'+(p.online?' on':'')+'"></span>'+esc(p.name)+' · '+esc(COMPANY[p.party])+'</span>').join('');
+  const pend=s.pending;
+  $('pending').hidden=!pend;
+  if(pend) $('pending').innerHTML='Waiting for <b>'+esc(COMPANY[pend.owner])+'</b> to approve '+esc(pend.by_name)+'’s request: “'+esc(pend.request)+'” — say “yes, go ahead”.';
+  $('events').innerHTML=(s.events||[]).slice().reverse().map(e=>'<div class="ev '+esc(e.decision||e.kind)+'">'+esc(e.text)+(e.reason_code?' <code>'+esc(e.reason_code)+'</code>':'')+'</div>').join('')||'<div class="muted">Say “Meridian, can we see …” to request material.</div>';
+  $('transcript').innerHTML=(s.transcript||[]).slice().reverse().map(x=>'<div class="line"><b class="'+x.party+'">'+esc(x.name)+'</b> '+esc(x.text)+'</div>').join('')||'<div class="muted">No speech yet.</div>';
+  $('criteria').innerHTML=(s.criteria||[]).map(c=>'<div>'+(c.completed?'✅':'⬜')+' '+esc(c.object)+' '+(c.current_count||0)+'/'+c.target_count+'</div>').join('');
+  if(s.ended) showEnded(s.ended);
+}
+init().catch(e=>{ $('who').textContent='Could not start: '+e.message+' (allow camera and microphone).'; });
+</script></body></html>"""
+
+
 if __name__ == "__main__":
     if not app:
         raise SystemExit("Flask is not installed. Run: pip install -r requirements.txt")
     debug = os.environ.get("MERIDIAN_DEBUG") == "1"
-    # 0.0.0.0 so the sandbox can reach /api/visual-criteria; request_allowed() limits who gets what.
-    app.run(host=os.environ.get("MERIDIAN_BIND", "0.0.0.0"), port=5050, debug=debug, use_reloader=False)
+    bind = os.environ.get("MERIDIAN_BIND", "0.0.0.0")
+    # HTTPS on 5443 for the meeting room: laptops get camera/mic only on a secure origin.
+    from werkzeug.serving import make_server
+    https = make_server(bind, 5443, app, threaded=True, ssl_context=ensure_tls_cert())
+    threading.Thread(target=https.serve_forever, daemon=True).start()
+    print(f"Meeting room (HTTPS): https://{lan_ip()}:5443/room")
+    # 0.0.0.0 so the sandbox can reach its endpoints; request_allowed() limits who gets what.
+    app.run(host=bind, port=5050, debug=debug, use_reloader=False)
