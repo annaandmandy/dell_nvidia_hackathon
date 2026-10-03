@@ -1,0 +1,166 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>MergeOps Huddle Capture</title>
+<style>
+  :root { --bg:#0f1115; --panel:#181b22; --line:#2a2f3a; --text:#e6e8ee; --muted:#8b93a5;
+          --blue:#3b82f6; --orange:#f59e0b; --red:#ef4444; --green:#22c55e; }
+  * { box-sizing:border-box; }
+  body { margin:0; background:var(--bg); color:var(--text); font:14px/1.5 system-ui, sans-serif; padding:24px 16px; }
+  main { max-width:860px; margin:0 auto; }
+  h1 { font-size:20px; margin:0 0 4px; }
+  .sub { color:var(--muted); margin:0 0 20px; }
+  .panel { background:var(--panel); border:1px solid var(--line); border-radius:10px; padding:16px; margin-bottom:16px; }
+  .row { display:flex; gap:12px; flex-wrap:wrap; align-items:center; }
+  button { background:var(--blue); color:#fff; border:0; border-radius:8px; padding:10px 16px; font-size:14px; cursor:pointer; }
+  button.stop { background:var(--red); }
+  button:disabled { opacity:.4; cursor:default; }
+  label { color:var(--muted); display:flex; gap:6px; align-items:center; }
+  .meter { flex:1; min-width:160px; }
+  .meter span { display:block; color:var(--muted); font-size:12px; margin-bottom:4px; }
+  .bar { height:8px; background:var(--line); border-radius:4px; overflow:hidden; }
+  .bar i { display:block; height:100%; width:0; background:var(--green); transition:width .1s; }
+  #status { font-size:13px; color:var(--muted); }
+  #status.live::before { content:"● "; color:var(--red); }
+  ol { list-style:none; margin:0; padding:0; max-height:55vh; overflow:auto; }
+  li { padding:8px 0; border-bottom:1px solid var(--line); display:flex; gap:12px; }
+  li time { color:var(--muted); font-variant-numeric:tabular-nums; flex:none; }
+  li .wr { color:var(--orange); font-size:12px; flex:none; }
+  .err { color:var(--red); }
+  ol:empty::after { content:"Transcript will appear here."; color:var(--muted); }
+</style>
+</head>
+<body>
+<main>
+  <h1>MergeOps Huddle Capture</h1>
+  <p class="sub">Open the Slack huddle in another Chrome tab, then share that tab's audio. Speech is transcribed locally by Whisper on the GB10.</p>
+
+  <section class="panel">
+    <div class="row">
+      <button id="start">Capture huddle tab</button>
+      <button id="stop" class="stop" disabled>Stop</button>
+      <label><input type="checkbox" id="useMic" checked> Include my microphone</label>
+      <span id="status">Idle</span>
+    </div>
+    <div class="row" style="margin-top:14px">
+      <div class="meter"><span>Huddle tab</span><div class="bar"><i id="lvTab"></i></div></div>
+      <div class="meter"><span>Microphone</span><div class="bar"><i id="lvMic"></i></div></div>
+    </div>
+  </section>
+
+  <section class="panel">
+    <ol id="log"></ol>
+  </section>
+</main>
+
+<script>
+const SR = 16000;                 // Whisper input rate
+const FRAME = 4096;               // ~256 ms per processor callback
+const MIN_SEC = 3, MAX_SEC = 8;   // cut on a pause after 3 s, force-cut at 8 s
+const SILENCE_RMS = 0.01;         // below this a frame counts as silence
+
+let ctx, proc, streams = [], buf = [], bufLen = 0, silentFrames = 0, voiced = false;
+const $ = id => document.getElementById(id);
+
+function rms(a) { let s = 0; for (let i = 0; i < a.length; i++) s += a[i] * a[i]; return Math.sqrt(s / a.length); }
+
+function meter(node, el) {
+  const an = ctx.createAnalyser(); an.fftSize = 512; node.connect(an);
+  const d = new Float32Array(an.fftSize);
+  (function tick() { if (!ctx) return; an.getFloatTimeDomainData(d);
+    el.style.width = Math.min(100, rms(d) * 400) + "%"; requestAnimationFrame(tick); })();
+}
+
+function encodeWav(samples) {
+  const out = new DataView(new ArrayBuffer(44 + samples.length * 2));
+  const w = (o, s) => [...s].forEach((c, i) => out.setUint8(o + i, c.charCodeAt(0)));
+  w(0, "RIFF"); out.setUint32(4, 36 + samples.length * 2, true); w(8, "WAVE"); w(12, "fmt ");
+  out.setUint32(16, 16, true); out.setUint16(20, 1, true); out.setUint16(22, 1, true);
+  out.setUint32(24, SR, true); out.setUint32(28, SR * 2, true); out.setUint16(32, 2, true);
+  out.setUint16(34, 16, true); w(36, "data"); out.setUint32(40, samples.length * 2, true);
+  for (let i = 0; i < samples.length; i++) {
+    const s = Math.max(-1, Math.min(1, samples[i]));
+    out.setInt16(44 + i * 2, s < 0 ? s * 0x8000 : s * 0x7fff, true);
+  }
+  return new Blob([out], { type: "audio/wav" });
+}
+
+function flush() {
+  if (!bufLen) return;
+  const pcm = new Float32Array(bufLen); let o = 0;
+  for (const b of buf) { pcm.set(b, o); o += b.length; }
+  const hadVoice = voiced;
+  buf = []; bufLen = 0; silentFrames = 0; voiced = false;
+  if (!hadVoice) return;                       // all silence: don't send (avoids Whisper hallucinations)
+  fetch("/api/audio", { method: "POST", body: encodeWav(pcm), headers: { "Content-Type": "audio/wav" } })
+    .then(r => r.json()).then(j => {
+      if (j.error) return addLine("--:--:--", j.error, false, true);
+      if (j.text) addLine(j.t, j.text, j.forwarded);
+    }).catch(e => addLine("--:--:--", "upload failed: " + e, false, true));
+}
+
+function addLine(t, text, forwarded, isErr) {
+  const li = document.createElement("li");
+  li.innerHTML = `<time>${t}</time><span class="${isErr ? "err" : ""}"></span>` + (forwarded ? `<span class="wr">→ War Room</span>` : "");
+  li.querySelector("span").textContent = text;
+  $("log").appendChild(li); $("log").scrollTop = $("log").scrollHeight;
+}
+
+async function start() {
+  try {
+    // Tab audio = the remote huddle participants. Chrome needs video:true to offer tab sharing.
+    const tab = await navigator.mediaDevices.getDisplayMedia({
+      video: true, audio: { suppressLocalAudioPlayback: false }, selfBrowserSurface: "exclude", preferCurrentTab: false,
+    });
+    tab.getVideoTracks().forEach(t => t.stop());
+    if (!tab.getAudioTracks().length) { alert("No audio shared — pick the Slack tab and tick 'Share tab audio'."); return; }
+    streams.push(tab);
+
+    ctx = new AudioContext({ sampleRate: SR });
+    const mix = ctx.createGain();
+    const tabSrc = ctx.createMediaStreamSource(tab); tabSrc.connect(mix); meter(tabSrc, $("lvTab"));
+
+    if ($("useMic").checked) {
+      // Your own voice isn't in the tab audio. Echo cancellation keeps the huddle playback out of the mic.
+      const mic = await navigator.mediaDevices.getUserMedia({ audio: { echoCancellation: true, noiseSuppression: true } });
+      streams.push(mic);
+      const micSrc = ctx.createMediaStreamSource(mic); micSrc.connect(mix); meter(micSrc, $("lvMic"));
+    }
+
+    proc = ctx.createScriptProcessor(FRAME, 1, 1);
+    proc.onaudioprocess = e => {
+      const f = new Float32Array(e.inputBuffer.getChannelData(0));
+      buf.push(f); bufLen += f.length;
+      if (rms(f) < SILENCE_RMS) silentFrames++; else { silentFrames = 0; voiced = true; }
+      const sec = bufLen / SR;
+      if ((sec >= MIN_SEC && silentFrames >= 2) || sec >= MAX_SEC) flush();
+    };
+    const mute = ctx.createGain(); mute.gain.value = 0;    // keep the graph pulling without playing back
+    mix.connect(proc); proc.connect(mute); mute.connect(ctx.destination);
+
+    tab.getAudioTracks()[0].addEventListener("ended", stop);
+    $("start").disabled = true; $("stop").disabled = false; $("useMic").disabled = true;
+    $("status").textContent = "Live — transcribing"; $("status").className = "live";
+  } catch (e) {
+    addLine("--:--:--", "capture failed: " + e.message, false, true);
+    stop();
+  }
+}
+
+function stop() {
+  if (proc) flush();
+  streams.forEach(s => s.getTracks().forEach(t => t.stop())); streams = [];
+  if (ctx) ctx.close(); ctx = null; proc = null;
+  $("start").disabled = false; $("stop").disabled = true; $("useMic").disabled = false;
+  $("status").textContent = "Idle"; $("status").className = "";
+}
+
+$("start").onclick = start;
+$("stop").onclick = stop;
+fetch("/api/transcript").then(r => r.json()).then(rows => rows.forEach(r => addLine(r.t, r.text, r.forwarded)));
+fetch("/health").then(r => r.json()).then(h => { if (!h.whisper) addLine("--:--:--", "Whisper (:5001) is not running yet", false, true); });
+</script>
+</body>
+</html>
